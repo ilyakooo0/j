@@ -1,4 +1,8 @@
-# j
+<p align="center">
+  <img src="logo.png" alt="j logo" width="200">
+</p>
+
+<p align="center"><em>Your repo is a function (not really)</em></p>
 
 **`j` is a functional-programming-centered command-line interface to Jujutsu
 (jj) repositories.** Instead of subcommands and flags, you write expressions in
