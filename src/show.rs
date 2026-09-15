@@ -1,0 +1,325 @@
+//! `show` (§5.2), unified diff (§4.9 `diff`), and the difftastic bridge (§7.10).
+
+use crate::eval::Interp;
+use crate::value::{BlobContent, Crash, FunVal, Value};
+
+pub fn show(interp: &Interp, v: &Value) -> String {
+    let s = render(interp, v);
+    // line breaking: one line if it fits in 80 columns
+    if s.chars().count() <= 80 {
+        return s;
+    }
+    render_wide(interp, v, 0)
+}
+
+fn render(interp: &Interp, v: &Value) -> String {
+    match v {
+        Value::Int(n) => {
+            if n.sign() == num_bigint::Sign::Minus {
+                format!("(0 - {})", n.magnitude())
+            } else {
+                n.to_string()
+            }
+        }
+        Value::Text(t) => text_literal(t),
+        Value::Bool(b) => b.to_string(),
+        Value::Id(id) => format!("@{}", id),
+        Value::List(xs) => {
+            // list elements must be atoms: parenthesise applications and
+            // operator expressions (§3.4)
+            let parts: Vec<String> = xs.iter().map(|x| render_atom(interp, x)).collect();
+            format!("[{}]", parts.join(" "))
+        }
+        Value::Record(m) => {
+            let parts: Vec<String> = m
+                .iter()
+                .map(|(k, x)| format!("{} = {}", k, render(interp, x)))
+                .collect();
+            format!("{{ {} }}", parts.join(", "))
+        }
+        Value::Blob(b) => match &b.content {
+            BlobContent::Resolved(bytes) => match String::from_utf8(bytes.as_ref().clone()) {
+                Ok(s) => format!("blob {}", text_literal(&s)),
+                Err(_) => "blob \"<binary>\"".into(),
+            },
+            BlobContent::Conflict(_) => {
+                let s = String::from_utf8_lossy(&b.bytes()).to_string();
+                format!("{{- unresolved -}} blob {}", text_literal(&s))
+            }
+        },
+        Value::Shape(s) => s.name.clone(),
+        Value::Fun(f) => render_fun(interp, f),
+    }
+}
+
+fn render_fun(interp: &Interp, f: &FunVal) -> String {
+    match f {
+        FunVal::Builtin { name, args, .. } => {
+            // operator builtins render parenthesised when bare
+            if args.is_empty() {
+                if is_operator_name(name) {
+                    format!("({})", name)
+                } else if name.starts_with('.') && name.len() > 1 {
+                    name.clone() // selector .name
+                } else if name == "(.)" {
+                    "(.)".into()
+                } else {
+                    name.clone()
+                }
+            } else {
+                // partial application: name followed by applied args
+                let base = if is_operator_name(name) {
+                    format!("({})", name)
+                } else if name == "(.)" {
+                    "(.)".into()
+                } else {
+                    name.clone()
+                };
+                // args may contain a baked-in value (compose, selectors)
+                match name.as_str() {
+                    "(.)" if args.len() == 2 => {
+                        format!(
+                            "(.) ({}) ({})",
+                            render_atom(interp, &args[0]),
+                            render_atom(interp, &args[1])
+                        )
+                    }
+                    _ => {
+                        let shown: Vec<String> =
+                            args.iter().map(|a| render_atom(interp, a)).collect();
+                        format!("{} {}", base, shown.join(" "))
+                    }
+                }
+            }
+        }
+        FunVal::Closure {
+            name: Some(n),
+            applied_args,
+            ..
+        } => {
+            if applied_args.is_empty() {
+                n.clone()
+            } else {
+                // partial application of a named definition: the name followed
+                // by the arguments supplied so far (§5.2)
+                let args: Vec<String> =
+                    applied_args.iter().map(|a| render_atom(interp, a)).collect();
+                format!("{} {}", n, args.join(" "))
+            }
+        }
+        FunVal::Closure {
+            name: None,
+            applied,
+            params,
+            body,
+            src,
+            ..
+        } => {
+            if *applied == 0 {
+                if src.is_empty() || src == "section" {
+                    crate::parse::render_lambda(params, body)
+                } else {
+                    src.clone()
+                }
+            } else {
+                let base = if src.is_empty() || src == "section" {
+                    crate::parse::render_lambda(params, body)
+                } else {
+                    src.clone()
+                };
+                format!("({}) <applied>", base)
+            }
+        }
+        FunVal::OrFun(a, b) => format!("({} or {})", render_atom(interp, a), render_atom(interp, b)),
+        FunVal::Labelled(n, _) => format!("%{}", n),
+        FunVal::ComposeLazy(f, g) => format!("({} . {})", render_atom(interp, f), render_atom(interp, g)),
+    }
+}
+
+fn render_atom(interp: &Interp, v: &Value) -> String {
+    // parenthesise if not atomic; a nested list is self-delimiting (a `[`
+    // cannot begin a postfix), but a record is not: `{ … }` following another
+    // element would parse as a record *update* on it (§3.4), so records keep
+    // their parens
+    let atomic = matches!(
+        v,
+        Value::Int(_) | Value::Text(_) | Value::Bool(_) | Value::Id(_) | Value::Shape(_) | Value::List(_)
+    );
+    let s = render(interp, v);
+    if atomic {
+        s
+    } else {
+        format!("({})", s)
+    }
+}
+
+fn is_operator_name(n: &str) -> bool {
+    matches!(
+        n,
+        "." | "*"
+            | "+"
+            | "-"
+            | "++"
+            | "::"
+            | "=="
+            | "/="
+            | "<"
+            | "<="
+            | ">"
+            | ">="
+            | "&&"
+            | "||"
+    )
+}
+
+pub fn text_literal(s: &str) -> String {
+    let mut out = String::from("\"");
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\t' => out.push_str("\\t"),
+            '\r' => out.push_str("\\r"),
+            _ => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
+fn render_wide(interp: &Interp, v: &Value, indent: usize) -> String {
+    match v {
+        Value::List(xs) if !xs.is_empty() => {
+            let mut out = String::from("[");
+            for (i, x) in xs.iter().enumerate() {
+                if i > 0 {
+                    out.push('\n');
+                    out.push_str(&" ".repeat(indent + 2));
+                }
+                // list elements must be atoms (§3.4)
+                let s = render_wide(interp, x, indent + 2);
+                if matches!(
+                    x,
+                    Value::Int(_)
+                        | Value::Text(_)
+                        | Value::Bool(_)
+                        | Value::Id(_)
+                        | Value::Shape(_)
+                        | Value::List(_)
+                        | Value::Record(_)
+                ) {
+                    out.push_str(&s);
+                } else {
+                    out.push_str(&format!("({})", s));
+                }
+            }
+            out.push(']');
+            out
+        }
+        Value::Record(m) if !m.is_empty() => {
+            let mut out = String::from("{ ");
+            for (i, (k, x)) in m.iter().enumerate() {
+                if i > 0 {
+                    out.push('\n');
+                    out.push_str(&" ".repeat(indent));
+                    out.push_str(", ");
+                }
+                out.push_str(&format!("{} = {}", k, render_wide(interp, x, indent + 2)));
+            }
+            out.push_str(" }");
+            out
+        }
+        _ => render(interp, v),
+    }
+}
+
+// ----------------------------------------------------------------------
+// unified diff, 3 lines of context, no headers (§4.9 `diff`)
+// ----------------------------------------------------------------------
+
+pub fn unified_diff(a: &str, b: &str) -> String {
+    let diff = similar::TextDiff::from_lines(a, b);
+    let mut out = String::new();
+    for hunk in diff.unified_diff().context_radius(3).iter_hunks() {
+        out.push_str(&format!("{}\n", hunk.header()));
+        for change in hunk.iter_changes() {
+            let sign = match change.tag() {
+                similar::ChangeTag::Delete => "-",
+                similar::ChangeTag::Insert => "+",
+                similar::ChangeTag::Equal => " ",
+            };
+            out.push_str(sign);
+            let text = change.to_string();
+            // similar yields the line with its terminator when present; the
+            // last line of a file without a trailing newline has none, so add
+            // one to keep the diff line-oriented
+            out.push_str(&text);
+            if !text.ends_with('\n') {
+                out.push('\n');
+            }
+        }
+    }
+    out
+}
+
+// ----------------------------------------------------------------------
+// difftastic (§7.10)
+// ----------------------------------------------------------------------
+
+pub fn difft(path: &Value, a: &Value, b: &Value) -> Result<Value, Crash> {
+    let comps = path.as_list()?;
+    let last = comps
+        .last()
+        .map(|c| c.as_text().map(|s| s.to_string()))
+        .transpose()?
+        .unwrap_or_else(|| "file".to_string());
+    let a_bytes = match a {
+        Value::Blob(bl) => bl.bytes(),
+        v => return Err(Crash::new(format!("difft: expected a Blob, got a {}", v.kind_name()))),
+    };
+    let b_bytes = match b {
+        Value::Blob(bl) => bl.bytes(),
+        v => return Err(Crash::new(format!("difft: expected a Blob, got a {}", v.kind_name()))),
+    };
+    let dir = tempfile::tempdir()
+        .map_err(|e| Crash::new(format!("difft: cannot create temp dir: {}", e)))?;
+    let old = dir.path().join(format!("old-{}", last));
+    let new = dir.path().join(format!("new-{}", last));
+    std::fs::write(&old, &a_bytes).map_err(|e| Crash::new(format!("difft: {}", e)))?;
+    std::fs::write(&new, &b_bytes).map_err(|e| Crash::new(format!("difft: {}", e)))?;
+    let mut cmd = std::process::Command::new("difft");
+    cmd.arg(&old).arg(&new);
+    cmd.stdin(std::process::Stdio::null());
+    if std::env::var_os("DFT_COLOR").is_none() && stdout_is_tty() {
+        cmd.env("DFT_COLOR", "always");
+    }
+    if std::env::var_os("DFT_WIDTH").is_none() && stdout_is_tty() {
+        if let Some(w) = terminal_width() {
+            cmd.env("DFT_WIDTH", w.to_string());
+        }
+    }
+    let out = cmd
+        .output()
+        .map_err(|_| Crash::new("difft: cannot execute `difft` (not on PATH)"))?;
+    Ok(Value::text(String::from_utf8_lossy(&out.stdout).to_string()))
+}
+
+pub fn stdout_is_tty() -> bool {
+    unsafe { libc::isatty(libc::STDOUT_FILENO) == 1 }
+}
+
+pub fn stdin_is_tty() -> bool {
+    unsafe { libc::isatty(libc::STDIN_FILENO) == 1 }
+}
+
+pub fn terminal_width() -> Option<usize> {
+    unsafe {
+        let mut ws: libc::winsize = std::mem::zeroed();
+        if libc::ioctl(libc::STDOUT_FILENO, libc::TIOCGWINSZ, &mut ws) == 0 && ws.ws_col > 0 {
+            Some(ws.ws_col as usize)
+        } else {
+            None
+        }
+    }
+}

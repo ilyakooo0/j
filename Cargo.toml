@@ -1,0 +1,24 @@
+[package]
+name = "j"
+version = "0.1.0"
+edition = "2021"
+description = "A functional-programming-centered CLI for Jujutsu repositories"
+
+[dependencies]
+jj-lib = "0.45"
+gix = { version = "0.87.1", default-features = false, features = ["sha1", "max-performance-safe"] }
+hex = "0.4"
+num-bigint = "0.4"
+pollster = "0.4"
+futures = "0.3"
+unicode-width = "0.2"
+tempfile = "3"
+similar = "2"
+libc = "0.2"
+
+[dev-dependencies]
+proptest = "1"
+test-strategy = "0.4"
+
+[profile.release]
+opt-level = 2

@@ -1,0 +1,341 @@
+//! Evaluator semantics tests (§4).
+
+use j::config;
+use j::domain::MemBackend;
+use j::eval::Interp;
+use j::parse::parse_expr;
+use j::value::{value_eq, Env, Value};
+use std::rc::Rc;
+
+const CONFIG: &str = include_str!("../config.j");
+
+fn make_interp() -> (Interp, config::Config) {
+    let cfg = config::load_config(CONFIG).expect("reference config must load");
+    let backend = Rc::new(MemBackend::new());
+    let mut interp = Interp::new(backend, cfg.shapes.clone(), Env::empty());
+    config::eval_config(&mut interp, &cfg).expect("reference config must evaluate");
+    (interp, cfg)
+}
+
+fn ev(interp: &mut Interp, cfg: &config::Config, src: &str) -> Result<Value, String> {
+    let outer = Rc::new(cfg.global_names.clone());
+    let e = parse_expr(src, outer).map_err(|p| format!("parse: {}", p.msg))?;
+    let e = config::resolve_ids(&e, interp).map_err(|_| "id resolution".to_string())?;
+    let env = interp.global_env();
+    interp
+        .eval(&Rc::new(e), &env)
+        .map_err(|c| format!("crash: {}", c.msg))
+}
+
+fn ok(interp: &mut Interp, cfg: &config::Config, src: &str) -> Value {
+    ev(interp, cfg, src).unwrap_or_else(|e| panic!("{} => {}", src, e))
+}
+
+fn crash(interp: &mut Interp, cfg: &config::Config, src: &str) -> String {
+    match ev(interp, cfg, src) {
+        Ok(v) => panic!("{} unexpectedly succeeded: {}", src, j::show::show(interp, &v)),
+        Err(m) => m,
+    }
+}
+
+macro_rules! check {
+    ($i:expr, $cfg:expr, $src:expr, $want:expr) => {{
+        let got = ok(&mut $i, &$cfg, $src);
+        assert!(
+            value_eq(&got, &$want).unwrap_or(false),
+            "{} => {}, want {}",
+            $src,
+            j::show::show(&$i, &got),
+            j::show::show(&$i, &$want)
+        );
+    }};
+}
+
+#[test]
+fn or_non_function_lhs_skips_rhs() {
+    let (mut i, cfg) = make_interp();
+    // rhs would crash; not evaluated
+    check!(i, cfg, "1 or head []", Value::int(1));
+    check!(i, cfg, "\"x\" or crash \"no\"", Value::text("x"));
+    // lhs crashes: rhs returned
+    check!(i, cfg, "head [] or 9", Value::int(9));
+}
+
+#[test]
+fn or_function_lifting() {
+    let (mut i, cfg) = make_interp();
+    // (f or g) x = f x or g x
+    check!(
+        i,
+        cfg,
+        "(head or (\\_ -> 5)) []",
+        Value::int(5)
+    );
+    check!(
+        i,
+        cfg,
+        "(head or (\\_ -> 5)) [7]",
+        Value::int(7)
+    );
+    // same rule applies again to the result
+    check!(
+        i,
+        cfg,
+        "((\\x -> head x or 0) or (\\_ -> 9)) []",
+        Value::int(0)
+    );
+    // lhs function, rhs not a function: lhs returned
+    let v = ok(&mut i, &cfg, "head or 3");
+    assert!(matches!(v, Value::Fun(_)), "expected a function");
+}
+
+#[test]
+fn short_circuit_booleans() {
+    let (mut i, cfg) = make_interp();
+    check!(i, cfg, "false && crash \"x\"", Value::Bool(false));
+    check!(i, cfg, "true || crash \"x\"", Value::Bool(true));
+    check!(i, cfg, "true && true", Value::Bool(true));
+    check!(i, cfg, "false || false", Value::Bool(false));
+    assert!(crash(&mut i, &cfg, "1 && true").contains("Bool"));
+    // rhs of || is not evaluated when lhs is true; non-Bool rhs crashes when reached
+    assert!(crash(&mut i, &cfg, "false || 1").contains("Bool"));
+}
+
+#[test]
+fn if_requires_bool() {
+    let (mut i, cfg) = make_interp();
+    check!(i, cfg, "if 1 == 1 then \"a\" else \"b\"", Value::text("a"));
+    let m = crash(&mut i, &cfg, "if [1] then 1 else 2");
+    assert!(m.contains("Bool"), "{}", m);
+}
+
+#[test]
+fn let_is_recursive() {
+    let (mut i, cfg) = make_interp();
+    // mutual recursion within one block
+    check!(
+        i,
+        cfg,
+        "let even = \\n -> if n == 0 then true else odd (n - 1); odd = \\n -> if n == 0 then false else even (n - 1) in even 10",
+        Value::Bool(true)
+    );
+    // later binding sees earlier
+    check!(i, cfg, "let x = 1; y = x + 1 in y", Value::int(2));
+}
+
+#[test]
+fn lexical_scoping() {
+    let (mut i, cfg) = make_interp();
+    // closures capture their environment
+    check!(
+        i,
+        cfg,
+        "let x = 1 in let f = \\y -> x + y in let x = 100 in f 1",
+        Value::int(2)
+    );
+}
+
+#[test]
+fn unbound_names_crash() {
+    let (mut i, cfg) = make_interp();
+    let m = crash(&mut i, &cfg, "nosuchname");
+    assert!(m.contains("unbound"), "{}", m);
+}
+
+#[test]
+fn applying_non_function_crashes() {
+    let (mut i, cfg) = make_interp();
+    assert!(crash(&mut i, &cfg, "1 2").contains("apply"));
+    assert!(crash(&mut i, &cfg, "\"x\" 1").contains("apply"));
+    assert!(crash(&mut i, &cfg, "[1] 2").contains("apply"));
+}
+
+#[test]
+fn record_selection_and_update() {
+    let (mut i, cfg) = make_interp();
+    check!(i, cfg, "{ a = 1 }.a", Value::int(1));
+    let m = crash(&mut i, &cfg, "{ a = 1 }.b");
+    assert!(m.contains("no field"), "{}", m);
+    let m = crash(&mut i, &cfg, "1 .a");
+    assert!(m.contains("select"), "{}", m);
+    // update never adds fields
+    let m = crash(&mut i, &cfg, "({ a = 1 }) { b = 2 }");
+    assert!(m.contains("no field"), "{}", m);
+    // selector function (record argument parenthesised)
+    check!(i, cfg, "(.a) ({ a = 42 })", Value::int(42));
+}
+
+#[test]
+fn equality_rules() {
+    let (mut i, cfg) = make_interp();
+    check!(i, cfg, "[1 [2]] == [1 [2]]", Value::Bool(true));
+    check!(i, cfg, "{ a = 1 } == { a = 1 }", Value::Bool(true));
+    check!(i, cfg, "{ a = 1 } == { a = 2 }", Value::Bool(false));
+    check!(i, cfg, "{ a = 1 } == { b = 1 }", Value::Bool(false));
+    check!(i, cfg, "1 /= 2", Value::Bool(true));
+    check!(i, cfg, "blob \"x\" == blob \"x\"", Value::Bool(true));
+    check!(i, cfg, "blob \"x\" == blob \"y\"", Value::Bool(false));
+    // comparing functions crashes
+    let m = crash(&mut i, &cfg, "map == map");
+    assert!(m.contains("function"), "{}", m);
+    // cross-kind is just false
+    check!(i, cfg, "1 == \"1\"", Value::Bool(false));
+    // ordering on non-Ints crashes
+    assert!(crash(&mut i, &cfg, "\"a\" < \"b\"").contains("Int"));
+}
+
+#[test]
+fn shapes_as_values() {
+    let (mut i, cfg) = make_interp();
+    let v = ok(&mut i, &cfg, "Commit");
+    assert!(matches!(v, Value::Shape(_)));
+    // alias of a record shape works
+    let v = ok(&mut i, &cfg, "Repo");
+    assert!(matches!(v, Value::Shape(_)));
+    // function-shaped typedecls crash when used
+    let m = crash(&mut i, &cfg, "Edit");
+    assert!(m.contains("shape"), "{}", m);
+    let m = crash(&mut i, &cfg, "Path");
+    assert!(m.contains("shape"), "{}", m);
+    let m = crash(&mut i, &cfg, "Undeclared");
+    assert!(m.contains("shape"), "{}", m);
+}
+
+#[test]
+fn new_id_mints_distinct_ids() {
+    let (mut i, cfg) = make_interp();
+    check!(i, cfg, "@ /= @", Value::Bool(true));
+    // in a lambda body, each application mints
+    check!(
+        i,
+        cfg,
+        "let f = \\_ -> @ in f 1 /= f 1",
+        Value::Bool(true)
+    );
+    // two mints in one expression are distinct
+    check!(i, cfg, "@ == @", Value::Bool(false));
+}
+
+#[test]
+fn label_literals_are_revsets() {
+    let (mut i, cfg) = make_interp();
+    // %name is a function
+    let v = ok(&mut i, &cfg, "%main");
+    assert!(matches!(v, Value::Fun(_)));
+    // show renders it back
+    check!(i, cfg, "show %main", Value::text("%main"));
+}
+
+#[test]
+fn path_literals_are_text_lists() {
+    let (mut i, cfg) = make_interp();
+    check!(
+        i,
+        cfg,
+        "./src/lexer.rs",
+        Value::list(vec![Value::text("src"), Value::text("lexer.rs")])
+    );
+    check!(i, cfg, "./", Value::list(vec![]));
+    check!(i, cfg, "./a/b/ == ./a/b", Value::Bool(true));
+}
+
+#[test]
+fn crash_messages_propagate() {
+    let (mut i, cfg) = make_interp();
+    let m = crash(&mut i, &cfg, "crash \"custom message\"");
+    assert!(m.contains("custom message"), "{}", m);
+}
+
+#[test]
+fn contract_result_checked() {
+    let (mut i, cfg) = make_interp();
+    // head : [a] -> a — no constraint, fine
+    check!(i, cfg, "head [1 2]", Value::int(1));
+    // length's result is Int
+    check!(i, cfg, "length \"x\" or 0", Value::int(0)); // length on text crashes (list only) -> or
+}
+
+#[test]
+fn goto_error_message() {
+    let (mut i, cfg) = make_interp();
+    // goto on an empty revset against a trivial repo
+    let m = ev(
+        &mut i,
+        &cfg,
+        "goto (labelled \"nope\")",
+    );
+    // the function is returned; applying it to a repo crashes — test via at
+    assert!(m.is_ok(), "goto itself is a value");
+}
+
+#[test]
+fn wildcard_patterns() {
+    let (mut i, cfg) = make_interp();
+    check!(i, cfg, "(\\_ -> 42) \"anything\"", Value::int(42));
+    check!(i, cfg, "(\\_ _ -> 1) 2 3", Value::int(1));
+}
+
+#[test]
+fn deeply_nested_or() {
+    let (mut i, cfg) = make_interp();
+    check!(
+        i,
+        cfg,
+        "head [] or head [] or head [] or 4",
+        Value::int(4)
+    );
+}
+
+#[test]
+fn very_deep_recursion() {
+    let (mut i, cfg) = make_interp();
+    let v = ev(
+        &mut i,
+        &cfg,
+        "let go = \\n -> if n == 0 then 0 else 1 + go (n - 1) in go 100000",
+    );
+    assert!(value_eq(&v.unwrap(), &Value::int(100000)).unwrap());
+}
+
+#[test]
+fn very_deep_or_recursion() {
+    // `or`-recursive walks (the shape of `top`/`tip` over history) must not
+    // consume native stack: crash-catching is part of the heap machine
+    let (mut i, cfg) = make_interp();
+    let v = ev(
+        &mut i,
+        &cfg,
+        "let go = \\n -> (if n <= 0 then crash \"bottom\" else go (n - 1)) or n in go 50000",
+    );
+    assert!(value_eq(&v.unwrap(), &Value::int(0)).unwrap());
+}
+
+#[test]
+fn or_caught_crash_yields_rhs_id() {
+    // a crash on the lhs, after minting an id, is caught and the rhs value is
+    // used (the mint on the failing branch is rewound)
+    let (mut i, cfg) = make_interp();
+    let v = ok(
+        &mut i,
+        &cfg,
+        "((\\_ -> let discard = @ in crash \"boom\") 0) or @",
+    );
+    assert!(matches!(v, Value::Id(_)), "got {}", j::show::show(&i, &v));
+}
+
+#[test]
+fn partial_application_values() {
+    let (mut i, cfg) = make_interp();
+    check!(i, cfg, "(take 2) [1 2 3 4]", Value::list(vec![Value::int(1), Value::int(2)]));
+    check!(i, cfg, "map ((+) 1) [1 2]", Value::list(vec![Value::int(2), Value::int(3)]));
+    check!(i, cfg, "foldl (.) id [not not] true", Value::Bool(true));
+}
+
+#[test]
+fn operator_as_function() {
+    let (mut i, cfg) = make_interp();
+    check!(i, cfg, "(+) 1 2", Value::int(3));
+    check!(i, cfg, "foldl (++) \"\" [\"a\" \"b\"]", Value::text("ab"));
+    check!(i, cfg, "(.) not not true", Value::Bool(true));
+    check!(i, cfg, "(::) 1 [2]", Value::list(vec![Value::int(1), Value::int(2)]));
+}

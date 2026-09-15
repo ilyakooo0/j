@@ -1,0 +1,2131 @@
+//! jj-lib backend (§7): repository location (§7.1), building the `Repo`
+//! value with snapshotting (§7.2/§7.4), persistence (§7.5), and the lock
+//! (§7.7). Reserved commands (fetch/push/undo/ops/init/clone/remote) remain
+//! stubs for a later session.
+
+use crate::config::Config;
+use crate::domain::{Backend, MetaInfo, ROOT_ID};
+use crate::eval::Interp;
+use crate::value::{BlobContent, BlobKind, BlobVal, Crash, Value};
+use jj_lib::backend::{CopyId, Signature, Timestamp, TreeValue};
+use jj_lib::commit::Commit;
+use jj_lib::config::{ConfigLayer, ConfigSource, StackedConfig};
+use jj_lib::default_backend_factories::{default_backend_factories, default_working_copy_factories};
+use jj_lib::gitignore::GitIgnoreFile;
+use jj_lib::matchers::{EverythingMatcher, NothingMatcher};
+use jj_lib::merge::{Diff, Merge};
+use jj_lib::merged_tree::MergedTree;
+use jj_lib::merged_tree_builder::MergedTreeBuilder;
+use jj_lib::backend::{CommitId, FileId};
+use jj_lib::object_id::ObjectId;
+use jj_lib::op_store::OperationId;
+use jj_lib::ref_name::{RefName, RemoteName, WorkspaceName, WorkspaceNameBuf};
+use jj_lib::repo::{ReadonlyRepo, Repo};
+use jj_lib::repo_path::{RepoPath, RepoPathBuf, RepoPathComponentBuf};
+use jj_lib::settings::UserSettings;
+use jj_lib::store::Store;
+use jj_lib::working_copy::SnapshotOptions;
+use jj_lib::workspace::Workspace;
+use std::collections::{BTreeMap, BTreeSet};
+use std::future::Future;
+use std::os::unix::io::AsRawFd;
+use std::path::PathBuf;
+use std::rc::Rc;
+use std::sync::{Arc, Mutex};
+
+fn block_on<F: Future>(f: F) -> F::Output {
+    pollster::block_on(f)
+}
+
+type OpenError = (u8, String);
+
+// ----------------------------------------------------------------------
+// locating and opening the repository (§7.1)
+// ----------------------------------------------------------------------
+
+fn find_repo_root() -> Option<PathBuf> {
+    let cwd = std::env::current_dir().ok()?;
+    for dir in cwd.ancestors() {
+        if dir.join(".jj").is_dir() {
+            return Some(dir.to_path_buf());
+        }
+    }
+    None
+}
+
+fn toml_string(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
+/// UserSettings from a StackedConfig containing only `user.name` and
+/// `user.email` (§7.9). Falls back to a placeholder identity when the
+/// config's `user` record cannot be evaluated here (undo/redo/ops read no
+/// config, §6.1).
+fn user_settings(cfg: Option<&Config>) -> UserSettings {
+    let (name, email) = match cfg {
+        Some(cfg) => crate::config::eval_user_only(&mut Interp::dummy(), cfg)
+            .unwrap_or_else(|_| ("j".to_string(), "j".to_string())),
+        None => ("j".to_string(), "j".to_string()),
+    };
+    let mut config = StackedConfig::with_defaults();
+    let text = format!(
+        "[user]\nname = {}\nemail = {}\n",
+        toml_string(&name),
+        toml_string(&email)
+    );
+    let layer =
+        ConfigLayer::parse(ConfigSource::User, &text).expect("generated user config should parse");
+    config.add_layer(layer);
+    UserSettings::from_config(config).expect("generated user config should be valid")
+}
+
+// ----------------------------------------------------------------------
+// repo -> value mapping (§7.2)
+// ----------------------------------------------------------------------
+
+struct StoredCommit {
+    commit: Commit,
+    change_id: String,
+    /// change id of the first jj parent ("" for the root commit)
+    first_parent: String,
+    /// change ids of all jj parents ("" entries impossible: the root has none)
+    all_parents: Vec<String>,
+    committer_millis: i64,
+}
+
+struct VisibleRepo {
+    /// change id -> stored commit
+    commits: BTreeMap<String, StoredCommit>,
+    /// change id -> remote bookmarks of `origin` pointing at it (§7.6)
+    labels: BTreeMap<String, Vec<String>>,
+    /// change id -> child change ids (first-parent tree)
+    children: BTreeMap<String, Vec<String>>,
+    /// the default workspace's working-copy commit, as a change id
+    wc_change_id: String,
+}
+
+impl Clone for VisibleRepo {
+    fn clone(&self) -> Self {
+        VisibleRepo {
+            commits: self
+                .commits
+                .iter()
+                .map(|(k, v)| {
+                    (
+                        k.clone(),
+                        StoredCommit {
+                            commit: v.commit.clone(),
+                            change_id: v.change_id.clone(),
+                            first_parent: v.first_parent.clone(),
+                            all_parents: v.all_parents.clone(),
+                            committer_millis: v.committer_millis,
+                        },
+                    )
+                })
+                .collect(),
+            labels: self.labels.clone(),
+            children: self.children.clone(),
+            wc_change_id: self.wc_change_id.clone(),
+        }
+    }
+}
+
+async fn read_visible(repo: &Arc<ReadonlyRepo>) -> Result<VisibleRepo, OpenError> {
+    let store = repo.store().clone();
+    // visible commits = ancestors (inclusive) of the visible heads (§7.2)
+    let mut commits: BTreeMap<String, StoredCommit> = BTreeMap::new();
+    let mut children: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    let mut count_by_change: BTreeMap<String, usize> = BTreeMap::new();
+    let mut visited: BTreeSet<CommitId> = BTreeSet::new();
+    let mut stack: Vec<CommitId> = repo.view().heads().iter().cloned().collect();
+    while let Some(id) = stack.pop() {
+        if !visited.insert(id.clone()) {
+            continue;
+        }
+        let commit = store
+            .get_commit_async(&id)
+            .await
+            .map_err(|e| (2, format!("cannot read commit: {}", e)))?;
+        let change_id = commit.change_id().reverse_hex();
+        *count_by_change.entry(change_id.clone()).or_default() += 1;
+        let mut first_parent = String::new();
+        if let Some(first) = commit.parent_ids().first() {
+            let parent_commit = store
+                .get_commit_async(first)
+                .await
+                .map_err(|e| (2, format!("cannot read commit: {}", e)))?;
+            let pcid = parent_commit.change_id().reverse_hex();
+            children.entry(pcid.clone()).or_default().push(change_id.clone());
+            first_parent = pcid;
+        }
+        let parent_ids = commit.parent_ids().to_vec();
+        let mut all_parents = Vec::new();
+        for pid in &parent_ids {
+            let pcommit = store
+                .get_commit_async(pid)
+                .await
+                .map_err(|e| (2, format!("cannot read commit: {}", e)))?;
+            all_parents.push(pcommit.change_id().reverse_hex());
+        }
+        commits.insert(
+            change_id.clone(),
+            StoredCommit {
+                committer_millis: commit.committer().timestamp.timestamp.0,
+                commit,
+                change_id,
+                first_parent,
+                all_parents,
+            },
+        );
+        stack.extend(parent_ids);
+    }
+    // §7.2: one change id on two visible commits is unsupported
+    for (change_id, n) in &count_by_change {
+        if *n > 1 {
+            return Err((
+                2,
+                format!(
+                    "change {} has two visible commits; j cannot operate on this repository",
+                    change_id
+                ),
+            ));
+        }
+    }
+
+    // labels: remote bookmarks of `origin` pointing at a commit (§7.6)
+    let mut labels: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for (name, remote_ref) in repo.view().remote_bookmarks(RemoteName::new("origin")) {
+        for cid in remote_ref.target.added_ids() {
+            if let Ok(c) = store.get_commit_async(cid).await {
+                labels
+                    .entry(c.change_id().reverse_hex())
+                    .or_default()
+                    .push(name.as_str().to_string());
+            }
+        }
+    }
+
+    let wc_commit_id = repo
+        .view()
+        .get_wc_commit_id(WorkspaceName::DEFAULT)
+        .cloned()
+        .ok_or_else(|| (2, "the default workspace has no working-copy commit".to_string()))?;
+    let wc_commit = store
+        .get_commit_async(&wc_commit_id)
+        .await
+        .map_err(|e| (2, format!("cannot read the working-copy commit: {}", e)))?;
+
+    Ok(VisibleRepo {
+        commits,
+        labels,
+        children,
+        wc_change_id: wc_commit.change_id().reverse_hex(),
+    })
+}
+
+// ----------------------------------------------------------------------
+// the backend
+// ----------------------------------------------------------------------
+
+pub struct JjInner {
+    workspace_root: PathBuf,
+    /// the one workspace (and store) for the whole run; every repo load and
+    /// working-copy mutation goes through it so trees always live in the
+    /// same store
+    workspace: Mutex<Workspace>,
+    /// repo at the operation the program is working against; updated after a
+    /// snapshot so persistence and the snapshot form one operation (§1.2)
+    repo: Mutex<Arc<ReadonlyRepo>>,
+    workspace_name: WorkspaceNameBuf,
+    /// visible map backing the `Backend` lookups during evaluation; filled by
+    /// build_interp with the post-snapshot map
+    visible: Mutex<Option<Arc<VisibleRepo>>>,
+    lock_guard: Mutex<Option<FileLock>>,
+    /// the snapshot transaction and working-copy lock, held between
+    /// build_interp and persist so the snapshot and the expression's edits
+    /// form one jj operation (§1.2); dropped uncommitted by printing runs
+    pending: Mutex<Option<PendingSnapshot>>,
+}
+
+/// holding the file keeps the flock
+pub struct FileLock(#[allow(dead_code)] std::fs::File);
+
+#[allow(dead_code)]
+struct PendingSnapshot {
+    /// repo as loaded at head, before the snapshot
+    pre_repo: Arc<ReadonlyRepo>,
+    /// the snapshot's rewritten wc commit and tree, to be folded into the
+    /// persisting operation (§1.2 step 8, §7.7)
+    new_wc_id: CommitId,
+    tree: MergedTree,
+}
+
+#[derive(Clone)]
+pub struct JjBackend {
+    inner: Arc<JjInner>,
+}
+
+impl JjBackend {
+    pub fn open(cfg: Option<&Config>) -> Result<JjBackend, OpenError> {
+        let root = find_repo_root().ok_or_else(|| {
+            (
+                2,
+                "no jj repository found in this directory or any parent".to_string(),
+            )
+        })?;
+        let settings = user_settings(cfg);
+        let workspace = Workspace::load(
+            &settings,
+            &root,
+            &default_backend_factories(),
+            &default_working_copy_factories(),
+        )
+        .map_err(|e| (2, format!("cannot load the workspace: {}", e)))?;
+        // only the default workspace is supported (§7.1)
+        if workspace.workspace_name() != WorkspaceName::DEFAULT {
+            return Err((
+                2,
+                format!(
+                    "this working copy belongs to workspace `{}`; only the default workspace is supported",
+                    workspace.workspace_name().as_str()
+                ),
+            ));
+        }
+        let workspace_name = workspace.workspace_name().to_owned();
+        let repo = block_on(workspace.repo_loader().load_at_head())
+            .map_err(|e| (2, format!("cannot load the repository at head: {}", e)))?;
+        Ok(JjBackend {
+            inner: Arc::new(JjInner {
+                workspace_root: root,
+                workspace: Mutex::new(workspace),
+                repo: Mutex::new(repo),
+                workspace_name,
+                visible: Mutex::new(None),
+                lock_guard: Mutex::new(None),
+                pending: Mutex::new(None),
+            }),
+        })
+    }
+
+    fn current_repo(&self) -> Arc<ReadonlyRepo> {
+        self.inner.repo.lock().unwrap().clone()
+    }
+
+    pub fn take_lock(&self) {
+        // an flock, not a lockfile: the OS releases it when the process dies,
+        // so a killed j (SIGINT, §1.3) never bricks the repository
+        let lock_path = self.inner.workspace_root.join(".jj").join("j.lock");
+        let file = match std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .open(&lock_path)
+        {
+            Ok(f) => f,
+            Err(e) => {
+                eprintln!("j: cannot create {}: {}", lock_path.display(), e);
+                std::process::exit(2);
+            }
+        };
+        let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        if rc != 0 {
+            eprintln!("j: another j is running in this repository");
+            std::process::exit(2);
+        }
+        *self.inner.lock_guard.lock().unwrap() = Some(FileLock(file));
+    }
+
+    pub fn build_interp(
+        &self,
+        cfg: &Config,
+        _text: &str,
+        snapshot: bool,
+    ) -> Result<(Interp, Value, Value), OpenError> {
+        // reload at head: a previous run (or another tool) may have advanced
+        // the operation since `open`
+        let head_repo = block_on(self.inner.workspace.lock().unwrap().repo_loader().load_at_head())
+            .map_err(|e| (2, format!("cannot reload the repository at head: {}", e)))?;
+        *self.inner.repo.lock().unwrap() = head_repo;
+        let loaded_visible = block_on(read_visible(&self.current_repo()))?;
+        let loaded = build_repo_value(&loaded_visible, &loaded_visible.wc_change_id)?;
+
+        let current = if snapshot {
+            // §7.4: snapshot the working directory into the wc commit; the
+            // snapshot operation is written but unpublished — a persisting
+            // run folds it into its own operation (§7.7)
+            let (post, pending) = block_on(self.snapshot_repo())?;
+            *self.inner.pending.lock().unwrap() = pending;
+            let vis = block_on(read_visible(&post))?;
+            let cur = build_repo_value(&vis, &vis.wc_change_id)?;
+            *self.inner.visible.lock().unwrap() = Some(Arc::new(vis));
+            cur
+        } else {
+            *self.inner.visible.lock().unwrap() = Some(Arc::new(loaded_visible));
+            loaded.clone()
+        };
+
+        let mut interp = Interp::new(
+            Rc::new(self.clone()),
+            cfg.shapes.clone(),
+            crate::value::Env::empty(),
+        );
+        // §7.2: if the focused commit is in the immutable set, the snapshot
+        // cannot go into it; the focus is a new empty child of it holding the
+        // snapshot, and persisting records that child
+        match self.focus_if_immutable(&mut interp, cfg, &current)? {
+            Some(adjusted) => {
+                // the persisted child is part of the loaded value too, so a
+                // run that changes nothing is a no-op
+                Ok((interp, adjusted.clone(), adjusted))
+            }
+            None => Ok((interp, loaded, current)),
+        }
+    }
+
+    /// If the focus of `current` is immutable, return a repo refocused on a
+    /// new empty child holding the focus's files (§7.2).
+    fn focus_if_immutable(
+        &self,
+        interp: &mut Interp,
+        cfg: &Config,
+        current: &Value,
+    ) -> Result<Option<Value>, OpenError> {
+        // evaluate the config to compute the immutable set
+        let mut probe = Interp::new(
+            Rc::new(self.clone()),
+            cfg.shapes.clone(),
+            crate::value::Env::empty(),
+        );
+        crate::config::eval_config(&mut probe, cfg).map_err(|c| (3, c.msg))?;
+        let immutable = crate::repo::compute_immutable(&mut probe, current)
+            .map_err(|c| (1, c.msg))?;
+        let focus_id = match current.field("root").and_then(|r| r.field("id")) {
+            Ok(Value::Id(i)) => i.to_string(),
+            _ => return Ok(None),
+        };
+        if !immutable.contains(&focus_id) {
+            return Ok(None);
+        }
+        // build: new empty child of the focus with the focus's files, minted id
+        let _ = interp;
+        let root = current.field("root").map_err(|c| (1, c.msg))?;
+        let files = root.field("files").map_err(|c| (1, c.msg))?;
+        let child = crate::value::Value::record(&[
+            ("files", files),
+            ("message", crate::value::Value::text("")),
+            ("labels", crate::value::Value::list(vec![])),
+            (
+                "id",
+                crate::value::Value::Id(Rc::new(probe.mint_id())),
+            ),
+        ]);
+        let child_subtree = crate::value::Value::record(&[
+            ("root", child.clone()),
+            ("children", crate::value::Value::list(vec![])),
+        ]);
+        let mut new_children: Vec<Value> = current
+            .field("children")
+            .map_err(|c| (1, c.msg))?
+            .as_list()
+            .map_err(|c| (1, c.msg))?
+            .to_vec();
+        new_children.push(child_subtree);
+        let parent = crate::value::Value::record(&[
+            ("children", crate::value::Value::list(new_children)),
+            ("context", current.field("context").map_err(|c| (1, c.msg))?),
+            ("root", root),
+        ]);
+        // refocus onto the child (it is the last child)
+        let child_id = match child.field("id").map_err(|c| (1, c.msg))? {
+            Value::Id(i) => i.to_string(),
+            _ => unreachable!(),
+        };
+        crate::repo::by_id(&parent, &child_id)
+            .map_err(|c| (1, c.msg))?
+            .ok_or_else(|| (1, "internal: cannot refocus".to_string()))
+            .map(Some)
+    }
+
+    /// Snapshot the working copy into the wc commit; returns the repo at the
+    /// snapshot operation (unpublished but written), or the pre-snapshot repo
+    /// if nothing changed.
+    async fn snapshot_repo(
+        &self,
+    ) -> Result<(Arc<ReadonlyRepo>, Option<PendingSnapshot>), OpenError> {
+        let mut ws_guard = self.inner.workspace.lock().unwrap();
+        let loader = ws_guard.repo_loader().clone();
+        let mut locked_ws = ws_guard.start_working_copy_mutation()
+            .await
+            .map_err(|e| (2, format!("cannot lock the working copy: {}", e)))?;
+        let options = SnapshotOptions {
+            base_ignores: GitIgnoreFile::empty(),
+            progress: None,
+            start_tracking_matcher: &EverythingMatcher,
+            force_tracking_matcher: &NothingMatcher,
+            max_new_file_size: u64::MAX,
+        };
+        let (new_tree, _stats) = locked_ws
+            .locked_wc()
+            .snapshot(&options)
+            .await
+            .map_err(|e| (2, format!("cannot snapshot the working copy: {}", e)))?;
+        let changed = new_tree.tree_ids() != locked_ws.locked_wc().old_tree().tree_ids();
+        if !changed {
+            locked_ws
+                .finish(self.current_repo().operation().id().clone())
+                .await
+                .map_err(|e| (2, format!("cannot finish the snapshot: {}", e)))?;
+            return Ok((self.current_repo(), None));
+        }
+        // the snapshotted tree lives in the workspace's store; drive the
+        // transaction from the workspace's repo loader so stores match
+        let ws_repo = loader
+            .load_at_head()
+            .await
+            .map_err(|e| (2, format!("cannot reload the repository: {}", e)))?;
+        let mut tx = ws_repo.start_transaction();
+        tx.set_is_snapshot(true);
+        let wc_commit = self.wc_commit(&ws_repo).await?;
+        let new_wc = tx
+            .repo_mut()
+            .rewrite_commit(&wc_commit)
+            .set_tree(new_tree)
+            .write()
+            .await
+            .map_err(|e| (2, format!("cannot write the snapshot commit: {}", e)))?;
+        tx.repo_mut()
+            .set_wc_commit(self.inner.workspace_name.clone(), new_wc.id().clone())
+            .map_err(|e| (2, format!("cannot set the working-copy commit: {}", e)))?;
+        tx.repo_mut()
+            .rebase_descendants()
+            .await
+            .map_err(|e| (2, format!("cannot rebase descendants: {}", e)))?;
+        // write but do NOT publish: a persisting run folds the snapshot into
+        // its own operation (§7.7); a printing run discards it entirely
+        let unpublished = tx
+            .write("snapshot working copy")
+            .await
+            .map_err(|e| (2, format!("cannot write the snapshot operation: {}", e)))?;
+        let op_id = unpublished.operation().id().clone();
+        let new_repo = unpublished.leave_unpublished();
+        // the working-copy state tracks the snapshot tree, against the
+        // current (published) head; persist will finish against its own op
+        locked_ws
+            .finish(self.current_repo().operation().id().clone())
+            .await
+            .map_err(|e| (2, format!("cannot finish the snapshot: {}", e)))?;
+        let _ = op_id;
+        let pending = PendingSnapshot {
+            pre_repo: self.current_repo(),
+            new_wc_id: new_wc.id().clone(),
+            tree: new_wc.tree().clone(),
+        };
+        Ok((new_repo, Some(pending)))
+    }
+
+
+
+    async fn wc_commit(&self, repo: &Arc<ReadonlyRepo>) -> Result<Commit, OpenError> {
+        let id = repo
+            .view()
+            .get_wc_commit_id(WorkspaceName::DEFAULT)
+            .cloned()
+            .ok_or_else(|| (2, "no working-copy commit".to_string()))?;
+        repo.store()
+            .get_commit_async(&id)
+            .await
+            .map_err(|e| (2, format!("cannot read the working-copy commit: {}", e)))
+    }
+
+    pub fn persist(
+        &self,
+        interp: &mut Interp,
+        cfg: &Config,
+        loaded: &Value,
+        _current: &Value,
+        new: &Value,
+        text: &str,
+    ) -> Result<(), Crash> {
+        if crate::value::value_eq(loaded, new)? {
+            return Ok(());
+        }
+        *interp.old_repo.borrow_mut() = Some(loaded.clone());
+        crate::repo::validate_repo(interp, new)?;
+
+        // fold the snapshot into this operation (§1.2 step 8): start from the
+        // pre-snapshot repo and reapply the snapshot's wc rewrite here
+        let pending = self.inner.pending.lock().unwrap().take();
+        let base = match &pending {
+            Some(p) => p.pre_repo.clone(),
+            None => self.current_repo(),
+        };
+        let store = base.store().clone();
+        let user_sig = self.user_signature(cfg)?;
+
+        let mut tx = base.start_transaction();
+        // the snapshot's wc rewrite, folded into this operation (§1.2): the
+        // walk below compares against its output, so the snapshot change and
+        // the expression's edits become one rewrite
+        let mut snapshot_wc: Option<Commit> = None;
+        if let Some(p) = &pending {
+            let wc_commit = block_on(self.wc_commit(&base)).map_err(|e| Crash::new(e.1))?;
+            let c = block_on(
+                tx.repo_mut()
+                    .rewrite_commit(&wc_commit)
+                    .set_tree(p.tree.clone())
+                    .write(),
+            )
+            .map_err(|e| Crash::new(format!("cannot write the snapshot commit: {}", e)))?;
+            snapshot_wc = Some(c);
+        }
+        // compare against the stored commits of the base operation (the
+        // snapshot's unpublished rewrite must not become a predecessor)
+        let mut old_stored: Arc<VisibleRepo> =
+            Arc::new(block_on(read_visible(&base)).map_err(|e| Crash::new(e.1))?);
+        if let Some(c) = &snapshot_wc {
+            let mut vis = (*old_stored).clone();
+            let change = c.change_id().reverse_hex();
+            if let Some(rec) = vis.commits.get_mut(&change) {
+                rec.commit = c.clone();
+            }
+            old_stored = Arc::new(vis);
+        }
+        let mut written: BTreeMap<String, CommitId> = BTreeMap::new();
+
+        // the root commit must be the top and unchanged (§7.5 step 4)
+        let top = crate::repo::by_id(new, ROOT_ID)?
+            .and_then(|loc| {
+                loc.field("context")
+                    .ok()
+                    .and_then(|c| c.as_list().ok().map(|l| l.is_empty()))
+                    .and_then(|is_top| if is_top { Some(loc) } else { None })
+            })
+            .ok_or_else(|| Crash::new("persistence: the root commit must be the top"))?;
+        let root_jj = block_on(store.get_commit_async(store.root_commit_id()))
+            .map_err(|e| Crash::new(format!("cannot read the root commit: {}", e)))?;
+        {
+            let root_v = top.field("root")?;
+            let msg = root_v.field("message")?.as_text()?.to_string();
+            if root_jj.description() != msg {
+                return Err(Crash::new("persistence: the root commit cannot be changed"));
+            }
+            let stored_files = block_on(tree_to_files(&store, &root_jj.tree()))
+                .map_err(|e| Crash::new(e.msg))?;
+            if !crate::value::value_eq(
+                &Value::list(stored_files),
+                &Value::list(root_v.field("files")?.as_list()?.to_vec()),
+            )? {
+                return Err(Crash::new("persistence: the root commit cannot be changed"));
+            }
+        }
+        written.insert(ROOT_ID.to_string(), root_jj.id().clone());
+
+        // walk `new` top-down (§7.5 step 4), parents before children
+        let mut queue: Vec<(Value, String)> = Vec::new(); // (subtree value, parent change id)
+        for kid in top.field("children")?.as_list()?.iter() {
+            queue.push((kid.clone(), ROOT_ID.to_string()));
+        }
+        while !queue.is_empty() {
+            let (subtree, parent_change) = queue.remove(0);
+            let commit_v = subtree.field("root")?;
+            let id = commit_id_of(&commit_v)?;
+            let parent_jj = written
+                .get(&parent_change)
+                .cloned()
+                .ok_or_else(|| Crash::new("persistence: internal: parent not yet written"))?;
+            let files_v = commit_v.field("files")?;
+            let message = commit_v.field("message")?.as_text()?.to_string();
+            let new_id = match old_stored.commits.get(&id) {
+                None => {
+                    let tree = block_on(build_tree(&store, &files_v))?;
+                    let change_id = jj_lib::backend::ChangeId::try_from_reverse_hex(&id).ok_or_else(|| {
+                        Crash::new(format!("persistence: `{}` is not a valid change id", id))
+                    })?;
+                    let c = block_on(
+                        tx.repo_mut()
+                            .new_commit(vec![parent_jj], tree)
+                            .set_change_id(change_id)
+                            .set_description(message)
+                            .set_author(user_sig.clone())
+                            .set_committer(user_sig.clone())
+                            .write(),
+                    )
+                    .map_err(|e| Crash::new(format!("cannot create commit: {}", e)))?;
+                    c.id().clone()
+                }
+                Some(stored) => {
+                    let stored_commit = &stored.commit;
+                    let parent_changed = hex_of(stored_commit.parent_ids().first()) != parent_jj.hex();
+                    let files_changed = {
+                        let stored_files = block_on(tree_to_files(&store, &stored_commit.tree()))?;
+                        !crate::value::value_eq(
+                            &Value::list(stored_files),
+                            &Value::list(files_v.as_list()?.to_vec()),
+                        )?
+                    };
+                    let msg_changed = stored_commit.description() != message;
+                    if parent_changed || files_changed || msg_changed {
+                        let tree = block_on(build_tree(&store, &files_v))?;
+                        let c = block_on(
+                            tx.repo_mut()
+                                .rewrite_commit(stored_commit)
+                                .set_parents(vec![parent_jj])
+                                .set_tree(tree)
+                                .set_description(message)
+                                .set_committer(user_sig.clone())
+                                .write(),
+                        )
+                        .map_err(|e| Crash::new(format!("cannot rewrite commit: {}", e)))?;
+                        c.id().clone()
+                    } else {
+                        stored_commit.id().clone()
+                    }
+                }
+            };
+            written.insert(id.clone(), new_id);
+            for kid in subtree.field("children")?.as_list()?.iter() {
+                queue.push((kid.clone(), id.clone()));
+            }
+        }
+
+        // §7.5 step 5: abandon ids in old that are not in new. Children were
+        // already re-placed explicitly by the top-down walk above, so record
+        // the abandon with no rebase targets (repo.rs:1075); calling
+        // record_abandoned_commit instead would rebase our new commits and
+        // trip the "descendants not rebased" assert in Transaction::write.
+        let new_ids = new_id_set(new)?;
+        for (id, stored) in &old_stored.commits {
+            if id == ROOT_ID || new_ids.contains(id) {
+                continue;
+            }
+            // abandon (§7.5 step 5): the walk has already re-placed every
+            // surviving descendant, so jj's rebase machinery has nothing left
+            // to do; the abandon is recorded for evolution bookkeeping
+            tx.repo_mut().record_abandoned_commit_with_parents(
+                stored.commit.id().clone(),
+                [stored.commit.parent_ids()[0].clone()],
+            );
+        }
+
+        // §7.5 step 6: set the working-copy commit to the focus (validate_repo
+        // has already checked mutability)
+        let focus_id = commit_id_of(&new.field("root")?)?;
+        let focus_jj = written
+            .get(&focus_id)
+            .cloned()
+            .ok_or_else(|| Crash::new("persistence: internal: focus not written"))?;
+        tx.repo_mut()
+            .set_wc_commit(self.inner.workspace_name.clone(), focus_jj.clone())
+            .map_err(|e| Crash::new(format!("cannot set the working-copy commit: {}", e)))?;
+
+        // the walk rewrites commits; descendants already written must not be
+        // left dangling (transaction invariant)
+        // every descendant of a rewritten or abandoned commit was re-placed
+        // by the walk itself, so jj's rebase machinery is a no-op here — but
+        // the transaction requires the bookkeeping to be flushed
+        block_on(tx.repo_mut().rebase_descendants())
+            .map_err(|e| Crash::new(format!("cannot rebase descendants: {}", e)))?;
+        let desc = truncate_chars(text, 200);
+        let unpublished = block_on(tx.write(desc))
+            .map_err(|e| Crash::new(format!("cannot write the operation: {}", e)))?;
+        let op_id = unpublished.operation().id().clone();
+        let _new_repo = block_on(unpublished.publish())
+            .map_err(|e| Crash::new(format!("cannot publish the operation: {}", e)))?;
+
+        // §7.4/§7.5 step 7: check out the focus to the working directory
+        let focus_commit = block_on(store.get_commit_async(&focus_jj))
+            .map_err(|e| Crash::new(format!("cannot read the focus commit: {}", e)))?;
+        block_on(self.checkout(&focus_commit, op_id))?;
+
+        Ok(())
+    }
+
+    async fn checkout(&self, commit: &Commit, op_id: OperationId) -> Result<(), Crash> {
+        let mut ws_guard = self.inner.workspace.lock().unwrap();
+        let mut locked_ws = ws_guard.start_working_copy_mutation()
+            .await
+            .map_err(|e| Crash::new(format!("cannot lock the working copy: {}", e)))?;
+        locked_ws
+            .locked_wc()
+            .check_out(commit)
+            .await
+            .map_err(|e| Crash::new(format!("cannot check out the focus: {}", e)))?;
+        locked_ws
+            .finish(op_id)
+            .await
+            .map_err(|e| Crash::new(format!("cannot finish the checkout: {}", e)))?;
+        Ok(())
+    }
+
+    fn user_signature(&self, cfg: &Config) -> Result<Signature, Crash> {
+        let (name, email) = crate::config::eval_user_only(&mut Interp::dummy(), cfg)?;
+        Ok(Signature {
+            name,
+            email,
+            timestamp: Timestamp::now(),
+        })
+    }
+
+    fn repo_loader(&self) -> jj_lib::repo::RepoLoader {
+        self.inner.workspace.lock().unwrap().repo_loader().clone()
+    }
+
+    fn head_repo(&self) -> Result<Arc<ReadonlyRepo>, OpenError> {
+        block_on(self.repo_loader().load_at_head())
+            .map_err(|e| (2, format!("cannot reload the repository at head: {}", e)))
+    }
+
+    async fn publish_tx(
+        &self,
+        tx: jj_lib::transaction::Transaction,
+        description: &str,
+    ) -> Result<(OperationId, Arc<ReadonlyRepo>), OpenError> {
+        let unpublished = tx
+            .write(description)
+            .await
+            .map_err(|e| (1, format!("cannot write the operation: {}", e)))?;
+        let op_id = unpublished.operation().id().clone();
+        let repo = unpublished
+            .publish()
+            .await
+            .map_err(|e| (1, format!("cannot publish the operation: {}", e)))?;
+        *self.inner.repo.lock().unwrap() = repo.clone();
+        Ok((op_id, repo))
+    }
+
+    fn git_subprocess_options(&self) -> Result<jj_lib::git::GitSubprocessOptions, OpenError> {
+        jj_lib::git::GitSubprocessOptions::from_settings(self.current_repo().settings())
+            .map_err(|e| (2, format!("cannot read git settings: {}", e)))
+    }
+
+    fn git_import_options(&self) -> Result<jj_lib::git::GitImportOptions, OpenError> {
+        let settings = jj_lib::git::GitSettings::from_settings(self.current_repo().settings())
+            .map_err(|e| (2, format!("cannot read git settings: {}", e)))?;
+        Ok(jj_lib::git::GitImportOptions {
+            abandon_unreachable_commits: settings.abandon_unreachable_commits,
+            record_synthetic_predecessors: settings.record_synthetic_predecessors,
+            remote_auto_track_bookmarks: std::collections::HashMap::new(),
+        })
+    }
+
+    /// fetch all bookmarks/tags of `remote` into the git repo, via the git
+    /// subprocess (jj-lib's GitFetch handles remote-name validation and the
+    /// refspec retry loop); the fetched refs are imported by the caller
+    fn git_fetch_refs(
+        &self,
+        mut_repo: &mut jj_lib::repo::MutableRepo,
+        remote: &RemoteName,
+    ) -> Result<(), OpenError> {
+        use jj_lib::str_util::StringExpression;
+        let expr = jj_lib::git::GitFetchRefExpression {
+            bookmark: StringExpression::all(),
+            tag: StringExpression::all(),
+        };
+        let expanded = jj_lib::git::expand_fetch_refspecs(remote, expr)
+            .map_err(|e| (1, format!("cannot expand the fetch refspecs: {}", e)))?;
+        let subprocess_options = self.git_subprocess_options()?;
+        let import_options = jj_lib::git::GitImportOptions {
+            abandon_unreachable_commits: true,
+            record_synthetic_predecessors: true,
+            remote_auto_track_bookmarks: std::collections::HashMap::new(),
+        };
+        let mut git_fetch = jj_lib::git::GitFetch::new(mut_repo, subprocess_options, &import_options)
+            .map_err(|_| (2, "the repository does not have a git backend".to_string()))?;
+        let mut callback = QuietGitCallback;
+        match git_fetch.fetch(remote, expanded, &mut callback, None) {
+            Ok(()) => Ok(()),
+            Err(jj_lib::git::GitFetchError::NoSuchRemote(_)) => {
+                // the backend's cached gix handle can be stale when the
+                // remote was just written to .git/config in this same run;
+                // fall back to a direct `git fetch` subprocess
+                let store = self.current_repo().store().clone();
+                let backend = git_backend(&store)?;
+                if remote_has_url(backend, remote) {
+                    git_fetch_subprocess(backend.git_repo_path(), remote)
+                } else {
+                    Err((1, format!("no remote {}", remote.as_str())))
+                }
+            }
+            Err(other) => Err((1, format!("fetch failed: {}", other))),
+        }
+    }
+
+    pub fn cmd_remote(&self, url: &str) -> Result<(), OpenError> {
+        self.take_lock();
+        let base = self.current_repo();
+        let origin = RemoteName::new("origin");
+        let exists = {
+            let git_repo = jj_lib::git::get_git_repo(base.store())
+                .map_err(|_| (2, "the repository does not have a git backend".to_string()))?;
+            git_repo.try_find_remote(origin.as_str()).is_some()
+        };
+        if exists {
+            jj_lib::git::set_remote_urls(base.store(), origin, Some(url), None)
+        } else {
+            let mut tx = base.start_transaction();
+            jj_lib::git::add_remote(tx.repo_mut(), origin, url, None)
+        }
+        .map_err(|e| (1, format!("cannot set the remote: {}", e)))
+    }
+
+    pub fn cmd_fetch(&self) -> Result<(), OpenError> {
+        let origin = RemoteName::new("origin");
+        let base = self.head_repo()?;
+        let mut tx = base.start_transaction();
+        self.git_fetch_refs(tx.repo_mut(), origin)?;
+        let import_options = self.git_import_options()?;
+        block_on(jj_lib::git::import_refs(tx.repo_mut(), &import_options))
+            .map_err(|e| (1, format!("cannot import the fetched refs: {}", e)))?;
+        block_on(tx.repo_mut().rebase_descendants())
+            .map_err(|e| (1, format!("cannot rebase descendants: {}", e)))?;
+        let _ = block_on(self.publish_tx(tx, "fetch"))?;
+        Ok(())
+    }
+    pub fn cmd_push(&self, cfg: &Config, expr_text: &str) -> Result<(), OpenError> {
+        let origin = RemoteName::new("origin");
+        let base = self.head_repo()?;
+        let (value, vis) = self.eval_push_expr(cfg, expr_text, &base)?;
+        let records = parse_push_records(&value, &vis, &base)?;
+        check_push_records(&records, &vis, &base)?;
+        let _ = self.push_to_origin(&base, origin, &records, expr_text)?;
+        Ok(())
+    }
+
+    /// evaluate `EXPR` against the recorded repository, without snapshotting
+    /// (§1.1), apply a function result to the repo value once (§7.6)
+    fn eval_push_expr(
+        &self,
+        cfg: &Config,
+        expr_text: &str,
+        base: &Arc<ReadonlyRepo>,
+    ) -> Result<(Value, Arc<VisibleRepo>), OpenError> {
+        let outer = Rc::new(cfg.global_names.clone());
+        let expr = crate::parse::parse_expr(expr_text, outer)
+            .map_err(|p| (3, format!("line {}: {}", p.line, p.msg)))?;
+        let (mut interp, _loaded, current) = self.build_interp(cfg, expr_text, false)?;
+        let expr = crate::config::resolve_ids(&expr, &interp).map_err(|failures| {
+            let (prefix, candidates) = &failures[0];
+            if candidates.is_empty() {
+                (1, format!("crash: `@{}` matches no commit", prefix))
+            } else {
+                (1, format!("crash: `@{}` is ambiguous", prefix))
+            }
+        })?;
+        crate::config::eval_config(&mut interp, cfg).map_err(|c| (3, format!("config.j: {}", c.msg)))?;
+        let env = interp.global_env();
+        let expr_rc = Rc::new(expr);
+        let mut v = interp
+            .eval(&expr_rc, &env)
+            .map_err(|c| (1, format!("crash: {}", c.msg)))?;
+        if matches!(v, Value::Fun(_)) {
+            v = interp
+                .apply(v, current)
+                .map_err(|c| (1, format!("crash: {}", c.msg)))?;
+        }
+        let _ = base;
+        let vis = self
+            .inner
+            .visible
+            .lock()
+            .unwrap()
+            .clone()
+            .ok_or_else(|| (2, "internal: repository value not loaded".to_string()))?;
+        Ok((v, vis))
+    }
+
+    /// push the updates to `origin` and record the new remote-bookmark
+    /// positions as one operation (§7.6)
+    fn push_to_origin(
+        &self,
+        base: &Arc<ReadonlyRepo>,
+        origin: &RemoteName,
+        records: &[(String, Option<CommitId>)],
+        description: &str,
+    ) -> Result<Arc<ReadonlyRepo>, OpenError> {
+        let mut targets = jj_lib::git::GitPushRefTargets::default();
+        for (name, after) in records {
+            let before = base
+                .view()
+                .get_remote_bookmark(RefName::new(name).to_remote_symbol(origin))
+                .target
+                .as_resolved()
+                .cloned()
+                .unwrap_or(None);
+            targets
+                .bookmarks
+                .push((jj_lib::ref_name::RefNameBuf::from(name.clone()), Diff::new(before, after.clone())));
+        }
+        let mut tx = base.start_transaction();
+        let subprocess_options = self.git_subprocess_options()?;
+        let mut callback = QuietGitCallback;
+        let stats = jj_lib::git::push_refs(
+            tx.repo_mut(),
+            subprocess_options,
+            origin,
+            &targets,
+            &mut callback,
+            &jj_lib::git::GitPushOptions::default(),
+        )
+        .map_err(|e| match e {
+            jj_lib::git::GitPushError::NoSuchRemote(_) => (1, "no remote origin".to_string()),
+            other => (1, format!("push failed: {}", other)),
+        })?;
+        if !stats.all_ok() {
+            let mut names: Vec<String> = Vec::new();
+            for (name, _) in stats.rejected.iter().chain(stats.remote_rejected.iter()) {
+                names.push(name.as_str().to_string());
+            }
+            return Err((1, format!("push rejected: {}", names.join(", "))));
+        }
+        let unpublished = block_on(tx.write(truncate_chars(description, 200)))
+            .map_err(|e| (1, format!("cannot write the operation: {}", e)))?;
+        let repo = block_on(unpublished.publish())
+            .map_err(|e| (1, format!("cannot publish the operation: {}", e)))?;
+        *self.inner.repo.lock().unwrap() = repo.clone();
+        Ok(repo)
+    }
+
+    pub fn cmd_undo(&self, redo: bool) -> Result<(), OpenError> {
+        let base = self.head_repo()?;
+        self.check_wc_clean(&base)?;
+        let loader = self.repo_loader();
+        let mut cur = base.operation().clone();
+        let target_op_id: OperationId;
+        loop {
+            match (op_marker(cur.metadata()), redo) {
+                (None, false) => {
+                    let Some(parent) = cur.parent_ids().first().cloned() else {
+                        return Err((1, "nothing to undo".to_string()));
+                    };
+                    target_op_id = parent;
+                    break;
+                }
+                (None, true) => return Err((1, "nothing to redo".to_string())),
+                (Some(m), false) if m.kind == "undo" => {
+                    if !m.authored_by_j {
+                        // degrade (§7.7): cannot follow the marker, so undo
+                        // this operation's own parent
+                        let Some(parent) = cur.parent_ids().first().cloned() else {
+                            return Err((1, "nothing to undo".to_string()));
+                        };
+                        target_op_id = parent;
+                        break;
+                    }
+                    let Some(grandparent) = op_parent_id(&loader, &m.id)? else {
+                        return Err((1, "nothing to undo".to_string()));
+                    };
+                    cur = block_on(loader.load_operation(&grandparent))
+                        .map_err(|e| (2, format!("cannot load an operation: {}", e)))?;
+                }
+                (Some(m), true) if m.kind == "undo" => {
+                    target_op_id = m.id;
+                    break;
+                }
+                (Some(m), false) => {
+                    // a redo: move past the undo it reversed
+                    if !m.authored_by_j {
+                        let Some(parent) = cur.parent_ids().first().cloned() else {
+                            return Err((1, "nothing to undo".to_string()));
+                        };
+                        target_op_id = parent;
+                        break;
+                    }
+                    cur = block_on(loader.load_operation(&m.id))
+                        .map_err(|e| (2, format!("cannot load an operation: {}", e)))?;
+                }
+                (Some(m), true) => {
+                    // a redo: reverse the undo it reversed, following further
+                    // redos to the operation ultimately reapplied
+                    target_op_id = if m.authored_by_j {
+                        block_on(chain_through_redos(&loader, &m.id))?
+                    } else {
+                        m.id
+                    };
+                    break;
+                }
+            }
+        }
+        let target_op = block_on(loader.load_operation(&target_op_id))
+            .map_err(|e| (2, format!("cannot load an operation: {}", e)))?;
+        let target_view = block_on(
+            loader
+                .op_store()
+                .read_view(target_op.view_id()),
+        )
+        .map_err(|e| (2, format!("cannot load an operation view: {}", e)))?;
+        // undoing the operation that established the working copy (e.g. the
+        // very first operation after init) would restore a view with no
+        // checked-out commit, leaving the repository unusable; there is
+        // nothing meaningful to undo
+        if !target_view
+            .wc_commit_ids
+            .contains_key(WorkspaceName::DEFAULT)
+        {
+            return Err((
+                1,
+                if redo {
+                    "nothing to redo".to_string()
+                } else {
+                    "nothing to undo".to_string()
+                },
+            ));
+        }
+        let marker = if redo {
+            format!("redo: {}", cur.id().hex())
+        } else {
+            format!("undo: {}", cur.id().hex())
+        };
+        let mut tx = base.start_transaction();
+        tx.repo_mut().set_view(target_view.clone());
+        let unpublished = block_on(tx.write(&marker))
+            .map_err(|e| (1, format!("cannot write the operation: {}", e)))?;
+        let op_id = unpublished.operation().id().clone();
+        let repo = block_on(unpublished.publish())
+            .map_err(|e| (1, format!("cannot publish the operation: {}", e)))?;
+        *self.inner.repo.lock().unwrap() = repo.clone();
+        let wc_commit = block_on(self.wc_commit(&repo))?;
+        block_on(self.checkout(&wc_commit, op_id)).map_err(|c| (1, c.msg))?;
+        Ok(())
+    }
+
+    /// refuse if the working directory differs from the focused commit's
+    /// files (§7.7): reserved commands never snapshot, so compare the locked
+    /// working copy's recorded tree with the focus commit's tree
+    fn check_wc_clean(&self, base: &Arc<ReadonlyRepo>) -> Result<(), OpenError> {
+        let dirty = (1, "working copy has changes not in @; run `j id` to record them or discard them".to_string());
+        let wc_commit = block_on(self.wc_commit(base))?;
+        // snapshot the working directory (without persisting anything) and
+        // compare against the focused commit's files (§7.7)
+        let mut ws_guard = self.inner.workspace.lock().unwrap();
+        let mut locked_ws = block_on(ws_guard.start_working_copy_mutation())
+            .map_err(|e| (2, format!("cannot lock the working copy: {}", e)))?;
+        let options = SnapshotOptions {
+            base_ignores: GitIgnoreFile::empty(),
+            progress: None,
+            start_tracking_matcher: &EverythingMatcher,
+            force_tracking_matcher: &NothingMatcher,
+            max_new_file_size: u64::MAX,
+        };
+        let (new_tree, _stats) = block_on(locked_ws.locked_wc().snapshot(&options))
+            .map_err(|e| (2, format!("cannot read the working copy: {}", e)))?;
+        let same = new_tree.tree_ids() == wc_commit.tree().tree_ids();
+        // discard: finish against the current op so no state changes
+        block_on(locked_ws.finish(base.operation().id().clone()))
+            .map_err(|e| (2, format!("cannot finish: {}", e)))?;
+        drop(ws_guard);
+        if !same {
+            return Err(dirty);
+        }
+        Ok(())
+    }
+
+    pub fn cmd_ops(&self) -> Result<(), OpenError> {
+        let base = self.head_repo()?;
+        let loader = self.repo_loader();
+        let head = base.operation().clone();
+        let mut out = String::new();
+        let mut cur = Some(head);
+        while let Some(op) = cur {
+            let end = op.metadata().time.end.timestamp.0.div_euclid(1000);
+            let age = crate::render::render_age(end);
+            let mut desc = op.metadata().description.trim().to_string();
+            let mut tag = "";
+            match op_kind(op.metadata()) {
+                OpKind::Normal => {}
+                OpKind::Undo { .. } => tag = "undo",
+                OpKind::Redo { .. } => tag = "redo",
+            }
+            if desc.is_empty() {
+                desc = "(no description)".to_string();
+            }
+            let mark = if op.id() == base.operation().id() {
+                "*"
+            } else {
+                " "
+            };
+            if tag.is_empty() {
+                out.push_str(&format!("{} {:>4}  {}\n", mark, age, desc));
+            } else {
+                out.push_str(&format!("{} {:>4}  {}  ({})\n", mark, age, desc, tag));
+            }
+            cur = match op.parent_ids().first() {
+                Some(p) => Some(
+                    block_on(loader.load_operation(p))
+                        .map_err(|e| (2, format!("cannot load an operation: {}", e)))?,
+                ),
+                None => None,
+            };
+        }
+        print!("{}", out);
+        Ok(())
+    }
+}
+
+pub fn cmd_init(cfg: &Config) -> Result<(), OpenError> {
+    let settings = user_settings_strict(cfg)?;
+    let cwd = std::env::current_dir()
+        .map_err(|e| (2, format!("cannot read the current directory: {}", e)))?;
+    for dir in cwd.ancestors() {
+        if dir.join(".jj").is_dir() {
+            return Err((
+                2,
+                format!("already inside a jj repository at {}", dir.display()),
+            ));
+        }
+    }
+    let git_dir = cwd.join(".git");
+    if git_dir.exists() && !git_dir.is_dir() {
+        return Err((
+            2,
+            ".git exists but is not a directory (a git worktree or submodule)".to_string(),
+        ));
+    }
+    let had_git = git_dir.is_dir();
+    let (workspace, repo) = if had_git {
+        // adopt the existing git repository (§7.8); init_colocated_git
+        // refuses to init over one
+        block_on(Workspace::init_external_git(&settings, &cwd, &git_dir))
+    } else {
+        block_on(Workspace::init_colocated_git(
+            &settings,
+            &cwd,
+            gix::hash::Kind::Sha1,
+        ))
+    }
+    .map_err(|e| (2, format!("cannot create the repository: {}", e)))?;
+    let backend = JjBackend {
+        inner: Arc::new(JjInner {
+            workspace_root: cwd.clone(),
+            workspace: Mutex::new(workspace),
+            repo: Mutex::new(repo),
+            workspace_name: WorkspaceName::DEFAULT.to_owned(),
+            visible: Mutex::new(None),
+            lock_guard: Mutex::new(None),
+            pending: Mutex::new(None),
+        }),
+    };
+    if had_git {
+        let import_options = backend.git_import_options()?;
+        let mut tx = backend.current_repo().start_transaction();
+        block_on(jj_lib::git::import_refs(tx.repo_mut(), &import_options))
+            .map_err(|e| (2, format!("cannot import the git history: {}", e)))?;
+        block_on(tx.repo_mut().rebase_descendants())
+            .map_err(|e| (2, format!("cannot rebase descendants: {}", e)))?;
+        let _ = block_on(backend.publish_tx(tx, "import git refs"))?;
+    }
+    create_initial_wc_commit(&backend, cfg, "init")?;
+    Ok(())
+}
+
+pub fn cmd_clone(cfg: &Config, url: &str, dir: &str) -> Result<(), OpenError> {
+    let settings = user_settings_strict(cfg)?;
+    let dir_path = PathBuf::from(dir);
+    if dir_path.join(".jj").is_dir() {
+        return Err((2, format!("{} already contains a jj repository", dir)));
+    }
+    if dir_path.is_dir() {
+        let mut entries = std::fs::read_dir(&dir_path)
+            .map_err(|e| (2, format!("cannot read {}: {}", dir, e)))?;
+        if entries.next().is_some() {
+            return Err((2, format!("{} already exists and is not empty", dir)));
+        }
+    } else if dir_path.exists() {
+        return Err((2, format!("{} already exists and is not empty", dir)));
+    }
+    std::fs::create_dir_all(&dir_path)
+        .map_err(|e| (2, format!("cannot create {}: {}", dir, e)))?;
+    let (workspace, repo) = block_on(Workspace::init_colocated_git(
+        &settings,
+        &dir_path,
+        gix::hash::Kind::Sha1,
+    ))
+    .map_err(|e| (2, format!("cannot create the repository: {}", e)))?;
+    let backend = JjBackend {
+        inner: Arc::new(JjInner {
+            workspace_root: dir_path.clone(),
+            workspace: Mutex::new(workspace),
+            repo: Mutex::new(repo),
+            workspace_name: WorkspaceName::DEFAULT.to_owned(),
+            visible: Mutex::new(None),
+            lock_guard: Mutex::new(None),
+            pending: Mutex::new(None),
+        }),
+    };
+    let origin = RemoteName::new("origin");
+    let mut tx = backend.current_repo().start_transaction();
+    jj_lib::git::add_remote(tx.repo_mut(), origin, url, None)
+        .map_err(|e| (1, format!("cannot set the remote: {}", e)))?;
+    backend.git_fetch_refs(tx.repo_mut(), origin)?;
+    let import_options = backend.git_import_options()?;
+    block_on(jj_lib::git::import_refs(tx.repo_mut(), &import_options))
+        .map_err(|e| (1, format!("cannot import the fetched refs: {}", e)))?;
+    block_on(tx.repo_mut().rebase_descendants())
+        .map_err(|e| (1, format!("cannot rebase descendants: {}", e)))?;
+    let _ = block_on(backend.publish_tx(tx, &format!("clone {}", url)))?;
+    create_initial_wc_commit(&backend, cfg, &format!("clone {}", url))?;
+    Ok(())
+}
+
+/// §7.8: after init/clone, create a working-copy commit as a child of the
+/// current head (a bookmark target if there is one, otherwise the root
+/// commit) and check it out.
+fn create_initial_wc_commit(
+    backend: &JjBackend,
+    cfg: &Config,
+    description: &str,
+) -> Result<(), OpenError> {
+    let base = backend.current_repo();
+    let store = base.store().clone();
+    let mut parent = store.root_commit_id().clone();
+    'outer: for (_name, target) in base.view().local_bookmarks() {
+        if let Some(id) = target.as_resolved().and_then(|t| t.clone()) {
+            parent = id;
+            break 'outer;
+        }
+    }
+    if parent == *store.root_commit_id() {
+        for (_name, remote_ref) in base.view().remote_bookmarks(RemoteName::new("origin")) {
+            if let Some(id) = remote_ref.target.as_resolved().and_then(|t| t.clone()) {
+                parent = id;
+                break;
+            }
+        }
+    }
+    // jj's own init already created a working-copy commit; if it is already
+    // a child of the target parent, keep it and just check it out
+    let mut to_abandon: Option<CommitId> = None;
+    if let Ok(existing) = block_on(backend.wc_commit(&base)) {
+        if existing.parent_ids().first() == Some(&parent) {
+            let op_id = base.operation().id().clone();
+            block_on(backend.checkout(&existing, op_id)).map_err(|c| (1, c.msg))?;
+            return Ok(());
+        }
+        if existing.id() != store.root_commit_id() {
+            to_abandon = Some(existing.id().clone());
+        }
+    }
+    let user_sig = backend
+        .user_signature(cfg)
+        .map_err(|c| (3, format!("config.j: {}", c.msg)))?;
+    let mut tx = base.start_transaction();
+    if let Some(old_wc) = &to_abandon {
+        tx.repo_mut().record_abandoned_commit_with_parents(
+            old_wc.clone(),
+            [store.root_commit_id().clone()],
+        );
+    }
+    let wc = block_on(
+        tx.repo_mut()
+            .new_commit(vec![parent], store.empty_merged_tree())
+            .set_author(user_sig.clone())
+            .set_committer(user_sig)
+            .write(),
+    )
+    .map_err(|e| (1, format!("cannot create the working-copy commit: {}", e)))?;
+    tx.repo_mut()
+        .set_wc_commit(backend.inner.workspace_name.clone(), wc.id().clone())
+        .map_err(|e| (1, format!("cannot set the working-copy commit: {}", e)))?;
+    block_on(tx.repo_mut().rebase_descendants())
+        .map_err(|e| (1, format!("cannot rebase descendants: {}", e)))?;
+    let unpublished = block_on(tx.write(truncate_chars(description, 200)))
+        .map_err(|e| (1, format!("cannot write the operation: {}", e)))?;
+    let op_id = unpublished.operation().id().clone();
+    let repo = block_on(unpublished.publish())
+        .map_err(|e| (1, format!("cannot publish the operation: {}", e)))?;
+    *backend.inner.repo.lock().unwrap() = repo;
+    block_on(backend.checkout(&wc, op_id)).map_err(|c| (1, c.msg))?;
+    Ok(())
+}
+
+/// user settings for init/clone: a missing or malformed `user` is a
+/// configuration error (exit 3) (§7.9)
+fn user_settings_strict(cfg: &Config) -> Result<UserSettings, OpenError> {
+    let (name, email) = crate::config::eval_user_only(&mut Interp::dummy(), cfg)
+        .map_err(|c| (3, format!("config.j: {}", c.msg)))?;
+    let mut config = StackedConfig::with_defaults();
+    let text = format!(
+        "[user]\nname = {}\nemail = {}\n",
+        toml_string(&name),
+        toml_string(&email)
+    );
+    let layer =
+        ConfigLayer::parse(ConfigSource::User, &text).expect("generated user config should parse");
+    config.add_layer(layer);
+    UserSettings::from_config(config)
+        .map_err(|e| (3, format!("config.j: invalid user settings: {}", e)))
+}
+
+// ----------------------------------------------------------------------
+// reserved-command helpers
+// ----------------------------------------------------------------------
+
+/// discards git subprocess sideband/progress output
+struct QuietGitCallback;
+
+impl jj_lib::git::GitSubprocessCallback for QuietGitCallback {
+    fn needs_progress(&self) -> bool {
+        false
+    }
+    fn progress(&mut self, _progress: &jj_lib::git::GitProgress) -> std::io::Result<()> {
+        Ok(())
+    }
+    fn local_sideband(
+        &mut self,
+        _message: &[u8],
+        _term: Option<jj_lib::git::GitSidebandLineTerminator>,
+    ) -> std::io::Result<()> {
+        Ok(())
+    }
+    fn remote_sideband(
+        &mut self,
+        _message: &[u8],
+        _term: Option<jj_lib::git::GitSidebandLineTerminator>,
+    ) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+fn git_backend(store: &Store) -> Result<&jj_lib::git_backend::GitBackend, OpenError> {
+    jj_lib::git::get_git_backend(store)
+        .map_err(|_| (2, "the repository does not have a git backend".to_string()))
+}
+
+/// whether the remote is configured in .git/config, seen through a fresh
+/// gix handle (the backend's cached handle may predate a just-written config)
+fn remote_has_url(backend: &jj_lib::git_backend::GitBackend, remote: &RemoteName) -> bool {
+    let Ok(fresh) = gix::open(backend.git_repo_path()) else {
+        return false;
+    };
+    match fresh.try_find_remote(remote.as_str()) {
+        Some(Ok(r)) => {
+            r.url(gix::remote::Direction::Fetch).is_some()
+                || r.url(gix::remote::Direction::Push).is_some()
+        }
+        _ => false,
+    }
+}
+
+/// `git fetch <remote>` + prune, with the backend's configured git binary
+fn git_fetch_subprocess(git_dir: &std::path::Path, remote: &RemoteName) -> Result<(), OpenError> {
+    let exe = std::env::var("J_GIT").unwrap_or_else(|_| "git".to_string());
+    let out = std::process::Command::new(exe)
+        .arg("--git-dir")
+        .arg(git_dir)
+        .args(["fetch", "--prune", remote.as_str()])
+        .stdin(std::process::Stdio::null())
+        .output()
+        .map_err(|e| (1, format!("cannot run git fetch: {}", e)))?;
+    if out.status.success() {
+        Ok(())
+    } else {
+        Err((
+            1,
+            format!(
+                "fetch failed: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            ),
+        ))
+    }
+}
+
+enum OpKind {
+    Normal,
+    /// the operation this undo discarded the view of
+    Undo { #[allow(dead_code)] undid: OperationId },
+    /// the undo this redo reversed
+    Redo { redid: OperationId },
+}
+
+/// a marker parsed from an operation description (§7.7 kinds)
+struct OpMarker {
+    kind: &'static str,
+    id: OperationId,
+    /// whether the description is j's own exact marker (`undo: <id>` /
+    /// `redo: <id>`); only those are reliably loadable for the walk
+    authored_by_j: bool,
+}
+
+/// §7.7 kinds: `j` marks undo/redo operations as `undo: <opid>` /
+/// `redo: <opid>` in the description (0.45's Transaction cannot write
+/// metadata tags); jj's own `undo operation <id>` / `redo operation <id>`
+/// markers are treated the same way.
+fn op_kind(meta: &jj_lib::op_store::OperationMetadata) -> OpKind {
+    match op_marker(meta) {
+        Some(OpMarker { kind: "undo", id, .. }) => OpKind::Undo { undid: id },
+        Some(OpMarker { kind: "redo", id, .. }) => OpKind::Redo { redid: id },
+        _ => OpKind::Normal,
+    }
+}
+
+fn op_marker(meta: &jj_lib::op_store::OperationMetadata) -> Option<OpMarker> {
+    let desc = meta.description.trim();
+    for kind in ["undo", "redo"] {
+        if let Some(rest) = desc.strip_prefix(&format!("{}:", kind)) {
+            if let Some(id) = parse_op_id(rest.trim()) {
+                return Some(OpMarker { kind, id, authored_by_j: true });
+            }
+        }
+        if let Some(rest) = desc.strip_prefix(&format!("{} operation", kind)) {
+            if let Some(id) = parse_op_id(rest.trim()) {
+                return Some(OpMarker { kind, id, authored_by_j: false });
+            }
+        }
+    }
+    None
+}
+
+/// a full-length (or prefix) hex operation id
+fn parse_op_id(s: &str) -> Option<OperationId> {
+    if s.is_empty() || !s.chars().all(|c| c.is_ascii_hexdigit()) {
+        return None;
+    }
+    hex::decode(pad_hex(s)).ok().map(OperationId::new)
+}
+
+fn pad_hex(s: &str) -> String {
+    if s.len() % 2 == 0 {
+        s.to_string()
+    } else {
+        format!("0{}", s)
+    }
+}
+
+fn op_parent_id(
+    loader: &jj_lib::repo::RepoLoader,
+    op_id: &OperationId,
+) -> Result<Option<OperationId>, OpenError> {
+    let op = block_on(loader.load_operation(op_id))
+        .map_err(|e| (2, format!("cannot load an operation: {}", e)))?;
+    Ok(op.parent_ids().first().cloned())
+}
+
+/// follow a chain of redos to the operation that was ultimately reapplied
+async fn chain_through_redos(
+    loader: &jj_lib::repo::RepoLoader,
+    first: &OperationId,
+) -> Result<OperationId, OpenError> {
+    let mut id = first.clone();
+    loop {
+        let op = loader
+            .load_operation(&id)
+            .await
+            .map_err(|e| (2, format!("cannot load an operation: {}", e)))?;
+        match op_kind(op.metadata()) {
+            OpKind::Redo { redid } => id = redid,
+            _ => return Ok(id),
+        }
+    }
+}
+
+/// parse the push-record list (§7.6): records of shape {id, name} set a
+/// bookmark, records of shape {delete} remove one; duplicates merge, the same
+/// name with different effects crashes (exit 1)
+fn parse_push_records(
+    value: &Value,
+    vis: &VisibleRepo,
+    repo: &Arc<ReadonlyRepo>,
+) -> Result<Vec<(String, Option<CommitId>)>, OpenError> {
+    let items = value
+        .as_list()
+        .map_err(|_| (1, "push: the expression must evaluate to a list of push records".to_string()))?;
+    let mut effects: BTreeMap<String, Option<String>> = BTreeMap::new();
+    for item in items {
+        let fields = item.field_set().ok_or_else(|| {
+            (1, "push: every element must be a record of shape {id, name} or {delete}".to_string())
+        })?;
+        if fields.len() == 1 && fields.contains("delete") {
+            let name = item
+                .field("delete")
+                .and_then(|v| v.as_text().map(|t| t.to_string()))
+                .map_err(|_| (1, "push: `delete` must be a Text".to_string()))?;
+            match effects.get(&name) {
+                Some(None) => {}
+                Some(Some(_)) => {
+                    return Err((1, format!("crash: two push records for `{}` disagree", name)))
+                }
+                None => {
+                    effects.insert(name, None);
+                }
+            }
+        } else if fields.len() == 2 && fields.contains("id") && fields.contains("name") {
+            let name = item
+                .field("name")
+                .and_then(|v| v.as_text().map(|t| t.to_string()))
+                .map_err(|_| (1, "push: `name` must be a Text".to_string()))?;
+            let id = match item.field("id") {
+                Ok(Value::Id(i)) => i.to_string(),
+                _ => return Err((1, "push: `id` must be an Id".to_string())),
+            };
+            match effects.get(&name) {
+                Some(Some(prev)) if prev == &id => {}
+                Some(_) => {
+                    return Err((1, format!("crash: two push records for `{}` disagree", name)))
+                }
+                None => {
+                    effects.insert(name, Some(id));
+                }
+            }
+        } else {
+            return Err((
+                1,
+                "push: every element must be a record of shape {id, name} or {delete}".to_string(),
+            ));
+        }
+    }
+    let origin = RemoteName::new("origin");
+    let mut out = Vec::new();
+    for (name, effect) in effects {
+        if !is_valid_git_branch_name(&name) {
+            return Err((1, format!("push: `{}` is not a valid git branch name", name)));
+        }
+        match effect {
+            Some(change_id) => {
+                let rec = vis.commits.get(&change_id).ok_or_else(|| {
+                    (1, format!("push: `@{}` is not a visible commit", change_id))
+                })?;
+                out.push((name, Some(rec.commit.id().clone())));
+            }
+            None => {
+                let remote_ref = repo
+                    .view()
+                    .get_remote_bookmark(RefName::new(&name).to_remote_symbol(origin));
+                if remote_ref.target.is_absent() {
+                    return Err((
+                        1,
+                        format!("push: the remote does not have a bookmark `{}`", name),
+                    ));
+                }
+                out.push((name, None));
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// §7.6: refuse to send commits with unresolved files or empty descriptions,
+/// and refuse to move/delete a bookmark whose current target is immutable
+/// away from a descendant of that target
+fn check_push_records(
+    records: &[(String, Option<CommitId>)],
+    vis: &VisibleRepo,
+    repo: &Arc<ReadonlyRepo>,
+) -> Result<(), OpenError> {
+    let store = repo.store().clone();
+    for (name, target) in records {
+        let mut seeds: Vec<String> = Vec::new();
+        if let Some(commit_id) = target {
+            let commit = block_on(store.get_commit_async(commit_id))
+                .map_err(|e| (2, format!("cannot read a commit: {}", e)))?;
+            let change_id = commit.change_id().reverse_hex();
+            if vis.commits.contains_key(&change_id) {
+                seeds.push(change_id);
+            }
+        }
+        if let Some(current) = repo
+            .view()
+            .get_remote_bookmark(RefName::new(name).to_remote_symbol(RemoteName::new("origin")))
+            .target
+            .as_resolved()
+            .cloned()
+            .unwrap_or(None)
+        {
+            let commit = block_on(store.get_commit_async(&current))
+                .map_err(|e| (2, format!("cannot read a commit: {}", e)))?;
+            let change_id = commit.change_id().reverse_hex();
+            if vis.commits.contains_key(&change_id) {
+                seeds.push(change_id);
+            }
+        }
+        let ancestors = ancestors_of_change_ids(vis, &seeds);
+        for change_id in &ancestors {
+            let rec = vis.commits.get(change_id).expect("ancestors are stored");
+            for (_path, value) in rec.commit.tree().entries() {
+                let value = value.map_err(|e| (2, format!("cannot read a tree: {}", e)))?;
+                if !value.is_resolved() {
+                    return Err((
+                        1,
+                        format!(
+                            "push: commit `@{}` has unresolved files",
+                            rec.change_id
+                        ),
+                    ));
+                }
+            }
+            if rec.commit.description().trim().is_empty() && rec.commit.id() != store.root_commit_id() {
+                return Err((
+                    1,
+                    format!("push: commit `@{}` has an empty description", rec.change_id),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// change-id closure of jj-parents from the seeds (all jj parents, not just
+/// the first), for the push content checks
+fn ancestors_of_change_ids(vis: &VisibleRepo, seeds: &[String]) -> BTreeSet<String> {
+    let mut seen = BTreeSet::new();
+    let mut stack: Vec<String> = seeds.to_vec();
+    while let Some(id) = stack.pop() {
+        if !seen.insert(id.clone()) {
+            continue;
+        }
+        if let Some(rec) = vis.commits.get(&id) {
+            for pid in rec.all_parents.iter() {
+                if !pid.is_empty() {
+                    stack.push(pid.clone());
+                }
+            }
+        }
+    }
+    seen
+}
+
+/// git-check-ref-format --branch rules
+fn is_valid_git_branch_name(name: &str) -> bool {
+    if name.is_empty()
+        || name.starts_with('-')
+        || name.starts_with('.')
+        || name.ends_with('.')
+        || name.ends_with('/')
+        || name.ends_with(".lock")
+        || name.contains("..")
+        || name.contains("//")
+        || name.contains("@{")
+        || name == "@"
+    {
+        return false;
+    }
+    name.chars().all(|c| {
+        !(c.is_ascii_control()
+            || matches!(c, ' ' | '~' | '^' | ':' | '?' | '*' | '[' | '\\'))
+    })
+}
+
+// ----------------------------------------------------------------------
+// Backend impl: metadata lookups and replay (§7.2, §7.3)
+// ----------------------------------------------------------------------
+
+impl Backend for JjBackend {
+    fn visible_ids(&self) -> Vec<String> {
+        match self.inner.visible.lock().unwrap().as_ref() {
+            Some(v) => v.commits.keys().cloned().collect(),
+            None => Vec::new(),
+        }
+    }
+
+    fn meta(&self, id: &str) -> Result<MetaInfo, Crash> {
+        let vis = self.inner.visible.lock().unwrap().clone();
+        let vis = vis.ok_or_else(|| Crash::new("meta: repository not loaded"))?;
+        let rec = vis
+            .commits
+            .get(id)
+            .ok_or_else(|| Crash::new("meta: no stored commit for this id"))?;
+        Ok(MetaInfo {
+            hash: rec.commit.id().hex(),
+            author: rec.commit.author().name.clone(),
+            email: rec.commit.author().email.clone(),
+            time: rec.commit.committer().timestamp.timestamp.0.div_euclid(1000),
+        })
+    }
+
+    fn is_merge(&self, id: &str) -> bool {
+        let vis = self.inner.visible.lock().unwrap().clone();
+        vis.and_then(|v| v.commits.get(id).map(|r| r.commit.parent_ids().len() >= 2))
+            .unwrap_or(false)
+    }
+
+    fn ancestors_closed(&self, ids: &BTreeSet<String>) -> BTreeSet<String> {
+        let vis = self.inner.visible.lock().unwrap().clone();
+        let Some(vis) = vis else {
+            return BTreeSet::new();
+        };
+        let mut seen = BTreeSet::new();
+        let mut stack: Vec<String> = ids.iter().cloned().collect();
+        while let Some(id) = stack.pop() {
+            if seen.insert(id.clone()) {
+                if let Some(rec) = vis.commits.get(&id) {
+                    if !rec.first_parent.is_empty() {
+                        stack.push(rec.first_parent.clone());
+                    }
+                }
+            }
+        }
+        seen
+    }
+
+    fn replay(&self, onto: &[Value], from: &[Value], to: &[Value]) -> Result<Vec<Value>, Crash> {
+        let store = self.current_repo().store().clone();
+        block_on(jj_replay(&store, onto, from, to))
+    }
+}
+
+// ----------------------------------------------------------------------
+// jj three-way tree merge for `replay` (§7.3)
+// ----------------------------------------------------------------------
+
+async fn jj_replay(
+    store: &Arc<Store>,
+    onto: &[Value],
+    from: &[Value],
+    to: &[Value],
+) -> Result<Vec<Value>, Crash> {
+    let onto_tree = build_tree(store, &Value::list(onto.to_vec())).await?;
+    let from_tree = build_tree(store, &Value::list(from.to_vec())).await?;
+    let to_tree = build_tree(store, &Value::list(to.to_vec())).await?;
+    let merge = Merge::from_removes_adds(
+        vec![from_tree.tree_ids().as_resolved().cloned().unwrap()],
+        vec![
+            onto_tree.tree_ids().as_resolved().cloned().unwrap(),
+            to_tree.tree_ids().as_resolved().cloned().unwrap(),
+        ],
+    );
+    // tree_merge::merge_trees resolves file contents line-level and keeps
+    // unresolvable paths as conflicts (tree_merge.rs:78)
+    let merged = jj_lib::tree_merge::merge_trees(store, merge)
+        .await
+        .map_err(|e| Crash::new(format!("replay: {}", e)))?;
+    // conflicts stay as unresolved blobs (§7.3)
+    let merged = MergedTree::new(store.clone(), merged, jj_lib::conflict_labels::ConflictLabels::unlabeled());
+    tree_to_files(store, &merged).await
+}
+
+// ----------------------------------------------------------------------
+// values -> jj trees
+// ----------------------------------------------------------------------
+
+/// A merged tree value: Merge<Option<TreeValue>> (jj_lib::backend::MergedTreeValue)
+type MergedTreeValueT = Merge<Option<TreeValue>>;
+
+struct ConflictTreeValue;
+
+impl ConflictTreeValue {
+    fn resolved(v: TreeValue) -> MergedTreeValueT {
+        Merge::resolved(Some(v))
+    }
+    fn new(adds: Vec<Option<TreeValue>>, removes: Vec<Option<TreeValue>>) -> MergedTreeValueT {
+        Merge::from_removes_adds(removes, adds)
+    }
+}
+
+async fn build_tree(store: &Arc<Store>, files: &Value) -> Result<MergedTree, Crash> {
+    let entries = files
+        .as_list()
+        .map_err(|c| Crash::new(format!("persistence: {}", c.msg)))?;
+    let map = crate::domain::snapshot_map(entries)?;
+    let mut builder = MergedTreeBuilder::new(store.empty_merged_tree());
+    for (path, content) in &map {
+        let repo_path = to_repo_path(path)?;
+        let value = blob_to_tree_value(store, content).await?;
+        builder.set_or_remove(repo_path, value);
+    }
+    builder
+        .write_tree()
+        .await
+        .map_err(|e| Crash::new(format!("cannot write a tree: {}", e)))
+}
+
+async fn blob_to_tree_value(store: &Arc<Store>, content: &Value) -> Result<MergedTreeValueT, Crash> {
+    let Value::Blob(b) = content else {
+        return Err(Crash::new("persistence: content is not a Blob"));
+    };
+    match &b.content {
+        BlobContent::Resolved(bytes) if b.kind == BlobKind::Symlink => {
+            let target = std::str::from_utf8(bytes)
+                .map_err(|_| Crash::new("persistence: symlink target is not UTF-8"))?;
+            let id = store
+                .write_symlink(&RepoPathBuf::root(), target)
+                .await
+                .map_err(|e| Crash::new(format!("cannot write a symlink: {}", e)))?;
+            Ok(ConflictTreeValue::resolved(TreeValue::Symlink(id)))
+        }
+        BlobContent::Resolved(bytes) => {
+            let mut slice: &[u8] = bytes.as_ref();
+            let id = store
+                .write_file(&RepoPathBuf::root(), &mut slice)
+                .await
+                .map_err(|e| Crash::new(format!("cannot write a file: {}", e)))?;
+            Ok(ConflictTreeValue::resolved(TreeValue::File {
+                id,
+                executable: b.kind == BlobKind::Executable,
+                copy_id: CopyId::placeholder(),
+            }))
+        }
+        BlobContent::Conflict(sides) => {
+            if sides.len() % 2 != 1 {
+                return Err(Crash::new("persistence: malformed conflict blob"));
+            }
+            // jj order: [add, (remove, add)*] → Merge with interleaved adds
+            // and removes
+            let mut values: Vec<Option<TreeValue>> = Vec::new();
+            for side in sides {
+                let mut slice: &[u8] = side.as_ref();
+                let id = store
+                    .write_file(&RepoPathBuf::root(), &mut slice)
+                    .await
+                    .map_err(|e| Crash::new(format!("cannot write a file: {}", e)))?;
+                values.push(Some(TreeValue::File {
+                    id,
+                    executable: b.kind == BlobKind::Executable,
+                    copy_id: CopyId::placeholder(),
+                }));
+            }
+            let mut adds = Vec::new();
+            let mut removes = Vec::new();
+            for (i, v) in values.into_iter().enumerate() {
+                if i % 2 == 0 {
+                    adds.push(v);
+                } else {
+                    removes.push(v);
+                }
+            }
+            Ok(ConflictTreeValue::new(adds, removes))
+        }
+    }
+}
+
+fn to_repo_path(path: &[String]) -> Result<RepoPathBuf, Crash> {
+    let mut p = RepoPathBuf::root();
+    for comp in path {
+        let c = RepoPathComponentBuf::new(comp.clone())
+            .map_err(|_| Crash::new(format!("invalid path component `{}`", comp)))?;
+        p = p.join(&c);
+    }
+    Ok(p)
+}
+
+// ----------------------------------------------------------------------
+// jj trees -> values
+// ----------------------------------------------------------------------
+
+async fn read_file_bytes(store: &Arc<Store>, path: &RepoPath, id: &FileId) -> Result<Vec<u8>, Crash> {
+    use futures::AsyncReadExt;
+    let mut reader = store
+        .read_file(path, id)
+        .await
+        .map_err(|e| Crash::new(format!("cannot read a file: {}", e)))?;
+    let mut buf = Vec::new();
+    reader
+        .read_to_end(&mut buf)
+        .await
+        .map_err(|e| Crash::new(format!("cannot read a file: {}", e)))?;
+    Ok(buf)
+}
+
+async fn side_to_bytes(
+    store: &Arc<Store>,
+    path: &RepoPath,
+    v: &Option<TreeValue>,
+) -> Result<Vec<u8>, Crash> {
+    match v {
+        Some(TreeValue::File { id, .. }) => read_file_bytes(store, path, id).await,
+        Some(TreeValue::Symlink(id)) => store
+            .read_symlink(path, id)
+            .await
+            .map(|s| s.into_bytes())
+            .map_err(|e| Crash::new(format!("cannot read a symlink: {}", e))),
+        _ => Ok(Vec::new()),
+    }
+}
+
+async fn merged_value_to_blob(
+    store: &Arc<Store>,
+    path: &RepoPath,
+    value: &jj_lib::backend::MergedTreeValue,
+) -> Result<Value, Crash> {
+    if let Some(v) = value.as_resolved() {
+        return match v {
+            Some(tv) => tree_value_to_blob(store, path, tv).await,
+            None => Ok(Value::Blob(Rc::new(BlobVal {
+                kind: BlobKind::Regular,
+                content: BlobContent::Resolved(Rc::new(Vec::new())),
+            }))),
+        };
+    }
+    // conflict sides, jj order: [add, (remove, add)*] (§7.3)
+    let mut sides: Vec<Rc<Vec<u8>>> = Vec::new();
+    for (i, add) in value.adds().enumerate() {
+        sides.push(Rc::new(side_to_bytes(store, path, add).await?));
+        if let Some(remove) = value.get_remove(i) {
+            sides.push(Rc::new(side_to_bytes(store, path, remove).await?));
+        }
+    }
+    Ok(Value::Blob(Rc::new(BlobVal {
+        kind: BlobKind::Regular,
+        content: BlobContent::Conflict(sides),
+    })))
+}
+
+async fn tree_value_to_blob(
+    store: &Arc<Store>,
+    path: &RepoPath,
+    value: &TreeValue,
+) -> Result<Value, Crash> {
+    match value {
+        TreeValue::File { id, executable, .. } => {
+            let buf = read_file_bytes(store, path, id).await?;
+            Ok(Value::Blob(Rc::new(BlobVal {
+                kind: if *executable {
+                    BlobKind::Executable
+                } else {
+                    BlobKind::Regular
+                },
+                content: BlobContent::Resolved(Rc::new(buf)),
+            })))
+        }
+        TreeValue::Symlink(id) => {
+            let target = store
+                .read_symlink(path, id)
+                .await
+                .map_err(|e| Crash::new(format!("cannot read a symlink: {}", e)))?;
+            Ok(Value::Blob(Rc::new(BlobVal {
+                kind: BlobKind::Symlink,
+                content: BlobContent::Resolved(Rc::new(target.into_bytes())),
+            })))
+        }
+        // a conflicted directory is emitted without its children by
+        // MergedTree::entries; §12 puts such repairs out of scope
+        TreeValue::Tree(_) | TreeValue::GitSubmodule(_) => Ok(Value::Blob(Rc::new(BlobVal {
+            kind: BlobKind::Regular,
+            content: BlobContent::Resolved(Rc::new(Vec::new())),
+        }))),
+    }
+}
+
+async fn tree_to_files(store: &Arc<Store>, tree: &MergedTree) -> Result<Vec<Value>, Crash> {
+    let mut out = Vec::new();
+    for (path, value) in tree.entries() {
+        let value = value.map_err(|e| Crash::new(format!("cannot read a tree entry: {}", e)))?;
+        let comps: Vec<String> = path
+            .components()
+            .map(|c| c.as_internal_str().to_string())
+            .collect();
+        let content = merged_value_to_blob(store, &path, &value).await?;
+        let p = Value::list(comps.into_iter().map(Value::text).collect());
+        out.push(Value::record(&[("content", content), ("path", p)]));
+    }
+    Ok(out)
+}
+
+// ----------------------------------------------------------------------
+// value helpers
+// ----------------------------------------------------------------------
+
+fn commit_id_of(commit: &Value) -> Result<String, Crash> {
+    match commit.field("id")? {
+        Value::Id(i) => Ok(i.to_string()),
+        v => Err(Crash::new(format!("expected an Id, got a {}", v.kind_name()))),
+    }
+}
+
+fn hex_of(id: Option<&CommitId>) -> String {
+    id.map(|i| i.hex()).unwrap_or_default()
+}
+
+fn truncate_chars(s: &str, n: usize) -> String {
+    s.chars().take(n).collect()
+}
+
+fn new_id_set(repo: &Value) -> Result<BTreeSet<String>, Crash> {
+    let mut out = BTreeSet::new();
+    for c in crate::repo::all_commits(repo)? {
+        out.insert(commit_id_of(&c)?);
+    }
+    Ok(out)
+}
+
+// ----------------------------------------------------------------------
+// building the Repo value from the visible map (§7.2)
+// ----------------------------------------------------------------------
+
+fn build_repo_value(vis: &VisibleRepo, focus_change: &str) -> Result<Value, OpenError> {
+    let root_rec = vis
+        .commits
+        .get(ROOT_ID)
+        .ok_or_else(|| (2, "no root commit".to_string()))?;
+    let store = root_rec.commit.store().clone();
+    let mut subtree = build_subtree(vis, root_rec, &store)?;
+    sort_subtree(&mut subtree, vis);
+    let top = Value::record(&[
+        ("children", subtree.field("children").map_err(|e| (2, e.msg))?),
+        ("context", Value::list(vec![])),
+        ("root", subtree.field("root").map_err(|e| (2, e.msg))?),
+    ]);
+    match crate::repo::by_id(&top, focus_change).map_err(|c| (2, c.msg))? {
+        Some(v) => Ok(v),
+        None => Err((2, "the working-copy commit is not visible".to_string())),
+    }
+}
+
+fn build_subtree(
+    vis: &VisibleRepo,
+    rec: &StoredCommit,
+    store: &Arc<Store>,
+) -> Result<Value, OpenError> {
+    let files = block_on(tree_to_files(store, &rec.commit.tree())).map_err(|c| (2, c.msg))?;
+    let labels: Vec<Value> = vis
+        .labels
+        .get(&rec.change_id)
+        .cloned()
+        .unwrap_or_default()
+        .into_iter()
+        .map(Value::text)
+        .collect();
+    let commit_v = Value::record(&[
+        ("files", Value::list(files)),
+        ("id", Value::Id(Rc::new(rec.change_id.clone()))),
+        ("labels", Value::list(labels)),
+        ("message", Value::text(rec.commit.description())),
+    ]);
+    let mut children = Vec::new();
+    if let Some(kids) = vis.children.get(&rec.change_id) {
+        for kid in kids {
+            if let Some(krec) = vis.commits.get(kid) {
+                children.push(build_subtree(vis, krec, store)?);
+            }
+        }
+    }
+    Ok(Value::record(&[("children", Value::list(children)), ("root", commit_v)]))
+}
+
+/// children ordered by committer timestamp asc, ties by change id asc (§7.2)
+fn sort_subtree(subtree: &mut Value, vis: &VisibleRepo) {
+    let mut kids: Vec<Value> = subtree
+        .field("children")
+        .and_then(|v| v.as_list().map(|l| l.to_vec()))
+        .unwrap_or_default();
+    for kid in kids.iter_mut() {
+        sort_subtree(kid, vis);
+    }
+    kids.sort_by(|a, b| {
+        let key = |v: &Value| -> (i64, String) {
+            let id = v
+                .field("root")
+                .and_then(|r| r.field("id"))
+                .ok()
+                .and_then(|i| match i {
+                    Value::Id(s) => Some(s.to_string()),
+                    _ => None,
+                })
+                .unwrap_or_default();
+            let t = vis.commits.get(&id).map(|r| r.committer_millis).unwrap_or(0);
+            (t, id)
+        };
+        key(a).cmp(&key(b))
+    });
+    let root = subtree.field("root").expect("subtree has a root");
+    *subtree = Value::record(&[("children", Value::list(kids)), ("root", root)]);
+}
