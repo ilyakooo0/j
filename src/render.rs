@@ -843,6 +843,7 @@ pub struct TreeOptions {
     pub elide: bool,
     pub icons: bool,
     pub color: String,
+    pub lanes: i64,
 }
 
 fn default_tree_options(_interp: &Interp) -> Result<TreeOptions, Crash> {
@@ -852,6 +853,7 @@ fn default_tree_options(_interp: &Interp) -> Result<TreeOptions, Crash> {
         elide: true,
         icons: false,
         color: "auto".into(),
+        lanes: 4,
     })
 }
 
@@ -873,6 +875,13 @@ pub fn tree_with(interp: &mut Interp, opts: &Value, repo: &Value) -> Result<Valu
         _ => return Err(Crash::new("treeWith: icons must be a Bool")),
     };
     let color = opts.field("color")?.as_text()?.to_string();
+    let lanes = match opts.field("lanes")? {
+        Value::Int(n) => n.to_string().parse::<i64>().unwrap_or(0),
+        _ => return Err(Crash::new("treeWith: lanes must be an Int")),
+    };
+    if lanes < 1 {
+        return Err(Crash::new("treeWith: lanes must be at least 1"));
+    }
     let pal = Palette {
         on: color_enabled(&color),
     };
@@ -882,14 +891,13 @@ pub fn tree_with(interp: &mut Interp, opts: &Value, repo: &Value) -> Result<Valu
         elide,
         icons,
         color,
+        lanes,
     };
     let text = tree_render(interp, &o, repo, &pal, true)?;
     Ok(Value::text(text))
 }
 
 struct CommitInfo {
-    #[allow(dead_code)]
-    commit: Value,
     id: String,
     message: String,
     labels: Vec<String>,
@@ -898,10 +906,132 @@ struct CommitInfo {
     immutable: bool,
     is_focus: bool,
     is_ancestor_of_focus: bool,
+    is_child_of_ancestor: bool,
     meta: Option<crate::domain::MetaInfo>,
     size: Option<usize>, // lines added+removed against parent
     detail_marks: Vec<(String, char)>,
     children: Vec<CommitInfo>,
+}
+
+impl CommitInfo {
+    /// §Elision: a commit is *interesting* — never folded into a run — if it is
+    /// the focus, labelled, conflicted, a leaf, or has more than one child; or
+    /// if it is an ancestor of the focus (or a child of one) **off the trunk**.
+    /// Trunk ancestors of the focus below the branch point are not interesting
+    /// on that ground alone, so an uninteresting run of them folds (as in the
+    /// worked example's `╎ 14`). The root is interesting only when it is not
+    /// buried in a longer uninteresting run — a distant root folds into the run
+    /// rather than being pinned at the top (§Option: far root). A run never
+    /// straddles the trunk boundary.
+    fn interesting(&self, trunk: &BTreeSet<String>) -> bool {
+        self.is_focus
+            || !self.labels.is_empty()
+            || self.conflict
+            || self.children.is_empty()
+            || self.children.len() > 1
+            || ((self.is_ancestor_of_focus || self.is_child_of_ancestor)
+                && !trunk.contains(&self.id))
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_info(
+    interp: &mut Interp,
+    opts: &TreeOptions,
+    loc: &Value,
+    commit: &Value,
+    children: &[Value],
+    immutable: &BTreeSet<String>,
+    focus_id: &str,
+    anc: &BTreeSet<String>,
+    parent_files: Option<&Value>,
+    with_focus: bool,
+    parent_is_ancestor: bool,
+) -> Result<CommitInfo, Crash> {
+    let id = match commit.field("id")? {
+        Value::Id(i) => i.to_string(),
+        _ => String::new(),
+    };
+    let message = commit.field("message")?.as_text()?.to_string();
+    let labels: Vec<String> = commit
+        .field("labels")?
+        .as_list()?
+        .iter()
+        .map(|l| l.as_text().map(|s| s.to_string()))
+        .collect::<Result<_, _>>()?;
+    let conflict = has_conflict(commit)?;
+    let files = commit.field("files")?;
+    let (empty, size, detail_marks) = match parent_files {
+        Some(pf) => {
+            let change = Value::record(&[("from", pf.clone()), ("to", files.clone())]);
+            let marks = touched_paths(&change)?;
+            let empty = marks.is_empty();
+            // size: lines added+removed against the parent
+            let from_map = snapshot_map_of(pf)?;
+            let to_map = snapshot_map_of(&files)?;
+            let mut lines = 0usize;
+            for (p, _, _) in &marks {
+                let key: Vec<String> = p.split('/').map(|s| s.to_string()).collect();
+                let count = |m: &BTreeMap<Vec<String>, Value>| -> usize {
+                    match m.get(&key) {
+                        Some(Value::Blob(b)) => {
+                            let n = String::from_utf8_lossy(&b.bytes()).lines().count();
+                            n.max(1)
+                        }
+                        _ => 1,
+                    }
+                };
+                lines += count(&from_map) + count(&to_map);
+            }
+            let marks2: Vec<(String, char)> =
+                marks.iter().map(|(p, m, _)| (p.clone(), *m)).collect();
+            (empty, Some(lines), marks2)
+        }
+        None => {
+            let n = files.as_list()?.len();
+            (n == 0 && id != ROOT_ID, None, Vec::new())
+        }
+    };
+    let meta = interp.backend.meta(&id).ok();
+    let is_focus = with_focus && id == focus_id;
+    let is_ancestor_of_focus = anc.contains(&id);
+    let mut infos = Vec::new();
+    for c in children.iter() {
+        let child_loc = crate::repo::by_id(loc, &match c.field("root")?.field("id")? {
+            Value::Id(i) => i.to_string(),
+            _ => continue,
+        })?
+        .unwrap();
+        infos.push(build_info(
+            interp,
+            opts,
+            &child_loc,
+            &c.field("root")?,
+            c.field("children")?.as_list()?,
+            immutable,
+            focus_id,
+            anc,
+            Some(&files),
+            with_focus,
+            is_ancestor_of_focus,
+        )?);
+    }
+    let immutable_flag = immutable.contains(&id);
+    Ok(CommitInfo {
+        id,
+        message,
+        labels,
+        conflict,
+        empty,
+        immutable: immutable_flag,
+        is_focus,
+        is_ancestor_of_focus,
+        is_child_of_ancestor: parent_is_ancestor,
+        meta,
+        size,
+        detail_marks,
+        children: infos,
+    })
 }
 
 fn tree_render(
@@ -932,7 +1062,7 @@ fn tree_render(
         }
         cur = crate::repo::by_id(&cur, &id_of_frame_parent(&ctx[0])?)?.unwrap();
     }
-    // build info tree from the top
+    // the whole history, from the top
     let top = crate::repo::by_id(repo, &top_id(repo)?)?.unwrap_or_else(|| repo.clone());
     let root_commit = top.field("root")?;
     let top_children = top.field("children")?;
@@ -947,12 +1077,56 @@ fn tree_render(
         &anc,
         None,
         with_focus,
+        false,
     )?;
-    // layout
-    let mut lines: Vec<String> = Vec::new();
-    let label_col_needed = has_labels(&root_info);
-    render_node(&root_info, opts, pal, "", true, true, label_col_needed, &mut lines);
-    Ok(lines.join("\n") + "\n")
+    // trunk T (§Trunk)
+    let trunk = compute_trunk(interp, repo)?;
+    let lanes_n = opts.lanes.max(1) as usize;
+    // Step 1 — display tree. The synthetic root is dropped when it is a pure
+    // anchor (exactly one child): the first real commit then starts the tree
+    // at the top, rather than pinning `⌂` above it. A root with several
+    // children is a genuine branch point and is kept (§Option: drop root).
+    let droot = if root_info.id == ROOT_ID && root_info.children.len() == 1 {
+        make_display(&root_info.children[0], opts.elide, &trunk)
+    } else {
+        make_display(&root_info, opts.elide, &trunk)
+    };
+    // Step 2 — row order (topological, oldest first)
+    let mut flat: Vec<&Display> = Vec::new();
+    flatten_display(&droot, &mut flat);
+    let preorder: BTreeMap<usize, usize> =
+        flat.iter().enumerate().map(|(i, n)| (n.uid(), i)).collect();
+    let mut ready: Vec<&Display> = vec![&droot];
+    let mut rows: Vec<&Display> = Vec::new();
+    while !ready.is_empty() {
+        let best = ready
+            .iter()
+            .enumerate()
+            .min_by_key(|(_, n)| (n.time(), preorder[&n.uid()]))
+            .map(|(i, _)| i)
+            .unwrap();
+        let n = ready.remove(best);
+        rows.push(n);
+        for c in n.children() {
+            ready.push(c);
+        }
+    }
+    // Step 3 — lanes
+    let placements = assign_lanes(&rows, &trunk, lanes_n);
+    // id column: shortest unique prefix among the display tree's commits, min 4
+    let ids: Vec<&str> = rows
+        .iter()
+        .filter_map(|n| n.commit().map(|c| c.id.as_str()))
+        .collect();
+    let prefix_len = |id: &str| -> usize {
+        let mut n = 4.min(id.len());
+        while n < id.len() && ids.iter().any(|o| *o != id && o.starts_with(&id[..n])) {
+            n += 1;
+        }
+        n
+    };
+    // Step 4 — draw
+    draw_rows(&rows, &placements, opts, pal, lanes_n, with_focus, &prefix_len)
 }
 
 fn id_of_frame_parent(frame: &Value) -> Result<String, Crash> {
@@ -977,100 +1151,1024 @@ fn top_id(repo: &Value) -> Result<String, Crash> {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-fn build_info(
-    interp: &mut Interp,
-    opts: &TreeOptions,
-    loc: &Value,
-    commit: &Value,
-    children: &[Value],
-    immutable: &BTreeSet<String>,
-    focus_id: &str,
-    anc: &BTreeSet<String>,
-    parent_files: Option<&Value>,
-    with_focus: bool,
-) -> Result<CommitInfo, Crash> {
-    let id = match commit.field("id")? {
-        Value::Id(i) => i.to_string(),
-        _ => String::new(),
-    };
-    let message = commit.field("message")?.as_text()?.to_string();
-    let labels: Vec<String> = commit
-        .field("labels")?
-        .as_list()?
-        .iter()
-        .map(|l| l.as_text().map(|s| s.to_string()))
-        .collect::<Result<_, _>>()?;
-    let conflict = has_conflict(commit)?;
-    let files = commit.field("files")?;
-    let (empty, size, detail_marks) = match parent_files {
-        Some(pf) => {
-            let change = Value::record(&[("from", pf.clone()), ("to", files.clone())]);
-            let marks = touched_paths(&change)?;
-            let empty = marks.is_empty();
-            let mut adds = 0usize;
-            // size: lines added+removed against the parent
-            for (_, m, _) in &marks {
-                match m {
-                    '+' | '−' => adds += 1,
-                    _ => adds += 1,
+/// The trunk (§Trunk): the config's `trunk` revset against the whole history.
+/// Empty → the root alone; one commit → it and its ancestors; more → crash.
+fn compute_trunk(interp: &mut Interp, repo: &Value) -> Result<BTreeSet<String>, Crash> {
+    let mut set = BTreeSet::new();
+    set.insert(top_id(repo)?);
+    let trunk_fn = interp
+        .globals
+        .lookup("trunk")
+        .ok_or_else(|| Crash::new("`trunk` is not defined"))?;
+    let v = interp.apply(trunk_fn, repo.clone())?;
+    let mut named: Vec<String> = Vec::new();
+    for idv in v.as_list()?.iter() {
+        match idv {
+            Value::Id(id) => named.push(id.to_string()),
+            _ => return Err(Crash::new("treeWith: trunk returned a non-Id")),
+        }
+    }
+    named.sort();
+    named.dedup();
+    match named.len() {
+        0 => Ok(set),
+        1 => {
+            let pmap: BTreeMap<String, String> =
+                crate::repo::parent_map(repo)?.into_iter().collect();
+            let mut cur = named[0].clone();
+            loop {
+                set.insert(cur.clone());
+                match pmap.get(&cur) {
+                    Some(p) => cur = p.clone(),
+                    None => break,
                 }
             }
-            let marks2: Vec<(String, char)> =
-                marks.iter().map(|(p, m, _)| (p.clone(), *m)).collect();
-            (empty, Some(adds), marks2)
+            Ok(set)
         }
-        None => {
-            let n = files.as_list()?.len();
-            (n == 0 && id != ROOT_ID, None, Vec::new())
-        }
-    };
-    let meta = interp.backend.meta(&id).ok();
-    let is_focus = with_focus && id == focus_id;
-    let mut infos = Vec::new();
-    for c in children.iter() {
-        let child_loc = crate::repo::by_id(loc, &match c.field("root")?.field("id")? {
-            Value::Id(i) => i.to_string(),
-            _ => continue,
-        })?
-        .unwrap();
-        infos.push(build_info(
-            interp,
-            opts,
-            &child_loc,
-            &c.field("root")?,
-            c.field("children")?.as_list()?,
-            immutable,
-            focus_id,
-            anc,
-            Some(&files),
-            with_focus,
-        )?);
+        n => Err(Crash::new(format!("treeWith: trunk names {} revisions", n))),
     }
-    let immutable_flag = immutable.contains(&id);
-    let anc_flag = anc.contains(&id);
-    Ok(CommitInfo {
-        commit: commit.clone(),
-        id,
-        message,
-        labels,
-        conflict,
-        empty,
-        immutable: immutable_flag,
-        is_focus,
-        is_ancestor_of_focus: anc_flag,
-        meta,
-        size,
-        detail_marks,
-        children: infos,
-    })
 }
 
-fn has_labels(info: &CommitInfo) -> bool {
-    if !info.labels.is_empty() {
-        return true;
+// ----------------------------------------------------------------------
+// Step 1 — the display tree (§Elision)
+// ----------------------------------------------------------------------
+
+enum Display {
+    Commit {
+        uid: usize,
+        info: CommitInfo,
+        children: Vec<Display>,
+    },
+    Run {
+        uid: usize,
+        count: usize,
+        time: Option<i64>,
+        in_trunk: bool,
+        child: Box<Display>,
+    },
+    Collapsed {
+        uid: usize,
+        info: CommitInfo,
+        hidden: usize,
+    },
+}
+
+impl Display {
+    fn uid(&self) -> usize {
+        match self {
+            Display::Commit { uid, .. } => *uid,
+            Display::Run { uid, .. } => *uid,
+            Display::Collapsed { uid, .. } => *uid,
+        }
     }
-    info.children.iter().any(has_labels)
+
+    fn time(&self) -> Option<i64> {
+        match self {
+            Display::Commit { info, .. } => info.meta.as_ref().map(|m| m.time),
+            Display::Run { time, .. } => *time,
+            Display::Collapsed { info, .. } => info.meta.as_ref().map(|m| m.time),
+        }
+    }
+
+    fn children(&self) -> &[Display] {
+        match self {
+            Display::Commit { children, .. } => children,
+            Display::Run { child, .. } => std::slice::from_ref(&**child),
+            Display::Collapsed { .. } => &[],
+        }
+    }
+
+    fn commit(&self) -> Option<&CommitInfo> {
+        match self {
+            Display::Commit { info, .. } => Some(info),
+            Display::Collapsed { info, .. } => Some(info),
+            Display::Run { .. } => None,
+        }
+    }
+
+    fn in_trunk(&self, trunk: &BTreeSet<String>) -> bool {
+        match self {
+            Display::Run { in_trunk, .. } => *in_trunk,
+            _ => self.commit().map(|c| trunk.contains(&c.id)).unwrap_or(false),
+        }
+    }
+}
+
+fn make_display(info: &CommitInfo, elide: bool, trunk: &BTreeSet<String>) -> Display {
+    let mut uid = 0usize;
+    make_display_rec(info, elide, trunk, true, &mut uid)
+}
+
+fn make_display_rec(
+    info: &CommitInfo,
+    elide: bool,
+    trunk: &BTreeSet<String>,
+    near: bool,
+    uid: &mut usize,
+) -> Display {
+    if !elide {
+        let my = *uid;
+        *uid += 1;
+        let children = info
+            .children
+            .iter()
+            .map(|c| make_display_rec(c, elide, trunk, true, uid))
+            .collect();
+        return Display::Commit {
+            uid: my,
+            info: clone_info(info, Vec::new()),
+            children,
+        };
+    }
+    if !near && !info.is_ancestor_of_focus && !info.is_focus {
+        let my = *uid;
+        *uid += 1;
+        return Display::Collapsed {
+            uid: my,
+            info: clone_info(info, Vec::new()),
+            hidden: count_descendants(info),
+        };
+    }
+    if info.interesting(trunk) {
+        let my = *uid;
+        *uid += 1;
+        let children = info
+            .children
+            .iter()
+            .map(|c| make_display_rec(c, elide, trunk, false, uid))
+            .collect();
+        return Display::Commit {
+            uid: my,
+            info: clone_info(info, Vec::new()),
+            children,
+        };
+    }
+    // uninteresting: gather the run down the single line of descent until the
+    // next interesting commit (which always exists: leaves are interesting).
+    // A run never straddles the trunk boundary: it stops before a commit whose
+    // trunk membership differs from the run's first commit.
+    let first_in_trunk = trunk.contains(&info.id);
+    let mut chain: Vec<&CommitInfo> = Vec::new();
+    let mut cur = info;
+    while !cur.interesting(trunk) && trunk.contains(&cur.id) == first_in_trunk {
+        chain.push(cur);
+        cur = &cur.children[0];
+    }
+    // A distant root folds into the run, but a root that would form a run of
+    // one — it is right next to an interesting commit, so it is not far — stays
+    // visible as a normal commit at the top of the tree.
+    if chain.len() == 1 && chain[0].id == ROOT_ID {
+        let my = *uid;
+        *uid += 1;
+        let children = info
+            .children
+            .iter()
+            .map(|c| make_display_rec(c, elide, trunk, near, uid))
+            .collect();
+        return Display::Commit {
+            uid: my,
+            info: clone_info(info, Vec::new()),
+            children,
+        };
+    }
+    let count = chain.len();
+    let in_trunk = chain.iter().all(|c| trunk.contains(&c.id));
+    let my = *uid;
+    *uid += 1;
+    Display::Run {
+        uid: my,
+        count,
+        time: chain[0].meta.as_ref().map(|m| m.time),
+        in_trunk,
+        child: Box::new(make_display_rec(cur, elide, trunk, near, uid)),
+    }
+}
+
+fn count_descendants(info: &CommitInfo) -> usize {
+    info.children.iter().map(|c| 1 + count_descendants(c)).sum()
+}
+
+fn clone_info(info: &CommitInfo, children: Vec<CommitInfo>) -> CommitInfo {
+    CommitInfo {
+        id: info.id.clone(),
+        message: info.message.clone(),
+        labels: info.labels.clone(),
+        conflict: info.conflict,
+        empty: info.empty,
+        immutable: info.immutable,
+        is_focus: info.is_focus,
+        is_ancestor_of_focus: info.is_ancestor_of_focus,
+        is_child_of_ancestor: info.is_child_of_ancestor,
+        meta: info.meta.clone(),
+        size: info.size,
+        detail_marks: info.detail_marks.clone(),
+        children,
+    }
+}
+
+fn flatten_display<'a>(n: &'a Display, out: &mut Vec<&'a Display>) {
+    out.push(n);
+    for c in n.children() {
+        flatten_display(c, out);
+    }
+}
+
+// ----------------------------------------------------------------------
+// Step 3 — lanes
+// ----------------------------------------------------------------------
+
+#[derive(Clone, Debug)]
+enum Rail {
+    Live,
+    Reserved(usize),
+}
+
+#[derive(Clone, Debug)]
+struct Placement {
+    lane: Option<usize>,
+    fork: Option<(usize, bool)>, // (source lane, source empties below)
+    reservations: Vec<(usize, usize)>, // (lane, child uid)
+    flattened: bool,
+}
+
+fn mark_subtree(n: &Display, set: &mut BTreeSet<usize>) {
+    set.insert(n.uid());
+    for c in n.children() {
+        mark_subtree(c, set);
+    }
+}
+
+fn assign_lanes(rows: &[&Display], trunk: &BTreeSet<String>, lanes_n: usize) -> Vec<Placement> {
+    let mut rails: Vec<Option<Rail>> = vec![None; lanes_n];
+    let mut out: Vec<Placement> = Vec::new();
+    let mut flattened: BTreeSet<usize> = BTreeSet::new();
+    for (idx, n) in rows.iter().enumerate() {
+        let in_trunk = n.in_trunk(trunk);
+        let parent = rows[..idx]
+            .iter()
+            .copied()
+            .find(|p| p.children().iter().any(|c| c.uid() == n.uid()));
+        let parent_lane = parent.and_then(|p| out[rows[..idx].iter().position(|x| x.uid() == p.uid()).unwrap()].lane);
+        let is_last_child = parent
+            .map(|p| {
+                let cs = p.children();
+                cs[cs.len() - 1].uid() == n.uid()
+            })
+            .unwrap_or(false);
+        let was_flat = flattened.contains(&n.uid());
+        let mut lane: Option<usize> = None;
+        let mut fork: Option<(usize, bool)> = None;
+        if !was_flat {
+            if idx == 0 {
+                lane = Some(0);
+            } else if in_trunk {
+                lane = Some(0);
+            } else if let Some(l) =
+                rails.iter().position(|r| matches!(r, Some(Rail::Reserved(u)) if *u == n.uid()))
+            {
+                lane = Some(l);
+            } else if let (Some(p), Some(pl)) = (parent, parent_lane) {
+                if !p.in_trunk(trunk) && is_last_child {
+                    // rule 4: inherit p's live rail
+                    lane = Some(pl);
+                } else {
+                    // rule 5: fork to the leftmost empty lane right of p's lane
+                    match (pl + 1..lanes_n).find(|&l| rails[l].is_none()) {
+                        Some(l) => {
+                            lane = Some(l);
+                            if is_last_child {
+                                fork = Some((pl, true));
+                                rails[pl] = None;
+                            } else {
+                                fork = Some((pl, false));
+                            }
+                        }
+                        None => mark_subtree(n, &mut flattened),
+                    }
+                }
+            } else {
+                mark_subtree(n, &mut flattened);
+            }
+        }
+        let now_flat = flattened.contains(&n.uid());
+        if !now_flat {
+            if let Some(l) = lane {
+                rails[l] = if n.children().is_empty() {
+                    None
+                } else {
+                    Some(Rail::Live)
+                };
+            }
+        }
+        // reservations: a trunk node with a trunk child reserves lanes for its
+        // side children that come after the trunk child in row order
+        let mut reservations: Vec<(usize, usize)> = Vec::new();
+        if !now_flat && in_trunk {
+            let cs = n.children();
+            if let Some(tpos) = cs.iter().position(|c| c.in_trunk(trunk)) {
+                for c in &cs[tpos + 1..] {
+                    if flattened.contains(&c.uid()) {
+                        continue;
+                    }
+                    match (1..lanes_n).find(|&l| rails[l].is_none()) {
+                        Some(l) => {
+                            rails[l] = Some(Rail::Reserved(c.uid()));
+                            reservations.push((l, c.uid()));
+                        }
+                        None => mark_subtree(c, &mut flattened),
+                    }
+                }
+            }
+        }
+        out.push(Placement {
+            lane: if now_flat { None } else { lane },
+            fork: if now_flat { None } else { fork },
+            reservations,
+            flattened: now_flat,
+        });
+    }
+    out
+}
+
+// ----------------------------------------------------------------------
+// Step 4 — drawing
+// ----------------------------------------------------------------------
+
+struct RowText {
+    gutter: String,
+    id: String,
+    bar: String,
+    msg: String,
+    labels: String,
+    age: String,
+    initials: String,
+    initials_author: String,
+}
+
+fn build_row_text(
+    n: &Display,
+    rows: &[&Display],
+    opts: &TreeOptions,
+    pal: &Palette,
+    with_focus: bool,
+    prefix_len: &dyn Fn(&str) -> usize,
+    run_extra: usize,
+    id_w: usize,
+) -> RowText {
+    let c = n.commit();
+    let is_focus = c.map(|x| x.is_focus).unwrap_or(false);
+    let gutter = if is_focus && with_focus { "▶ " } else { "  " }.to_string();
+    // id (on a run row the count follows ╎; only the part that overflows the
+    // rails area spills into the id column)
+    let id = match n {
+        Display::Run { .. } => {
+            let mut s = String::new();
+            while width(&s) < run_extra + id_w {
+                s.push(' ');
+            }
+            s
+        }
+        _ => match c {
+            Some(info) => {
+                let k = prefix_len(&info.id);
+                let p = &info.id[..k.min(info.id.len())];
+                // prefix with `@` so the id matches the id-literal syntax (@wqzt)
+                let colored = if info.conflict {
+                    pal.red(&format!("@{}", p))
+                } else if info.immutable {
+                    pal.blue(&format!("@{}", p))
+                } else {
+                    format!("@{}", p)
+                };
+                let plain = k + 1; // +1 for the @
+                let padded = if plain < id_w {
+                    format!("{}{}", colored, " ".repeat(id_w - plain))
+                } else {
+                    colored
+                };
+                padded
+            }
+            None => " ".repeat(id_w),
+        },
+    };
+    // size bar
+    let focus_idx = rows
+        .iter()
+        .position(|m| m.commit().map(|x| x.is_focus).unwrap_or(false));
+    let is_focus_parent = focus_idx
+        .map(|fi| {
+            rows[..fi].iter().any(|p| {
+                p.children()
+                    .iter()
+                    .any(|ch| ch.uid() == rows[fi].uid()) && p.uid() == n.uid()
+            })
+        })
+        .unwrap_or(false);
+    let is_focus_child = focus_idx
+        .map(|fi| rows[fi].children().iter().any(|ch| ch.uid() == n.uid()))
+        .unwrap_or(false);
+    let show_bar = opts.detail >= 1
+        && c.map(|x| opts.detail >= 2 || x.is_focus || is_focus_parent || is_focus_child)
+            .unwrap_or(false);
+    let bar = if show_bar {
+        c.map(|x| size_bar(x.size, pal)).unwrap_or_default()
+    } else {
+        String::new()
+    };
+    // message
+    let msg_first = c.map(|x| x.message.lines().next().unwrap_or("")).unwrap_or("");
+    let mut msg = match c {
+        Some(info) if info.empty => pal.dim_italic(msg_first),
+        _ => msg_first.to_string(),
+    };
+    if let Display::Collapsed { hidden, .. } = n {
+        if *hidden > 0 {
+            if !msg.is_empty() {
+                msg.push_str("  ");
+            }
+            msg.push_str(&format!("⋯ {}", hidden));
+        }
+    }
+    let labels = c.map(|x| x.labels.join("  ")).unwrap_or_default();
+    let (age, init, author) = match c.and_then(|x| x.meta.as_ref()) {
+        // the root's margin is not shown (§worked example)
+        Some(m) if opts.margin && c.map(|x| x.id != ROOT_ID).unwrap_or(false) => {
+            (render_age(m.time), initials(&m.author), m.author.clone())
+        }
+        _ => (String::new(), String::new(), String::new()),
+    };
+    RowText {
+        gutter,
+        id,
+
+        bar,
+        msg,
+        labels,
+        age,
+        initials: init,
+        initials_author: author,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn draw_rows(
+    rows: &[&Display],
+    placements: &[Placement],
+    opts: &TreeOptions,
+    pal: &Palette,
+    lanes_n: usize,
+    with_focus: bool,
+    prefix_len: &dyn Fn(&str) -> usize,
+) -> Result<String, Crash> {
+    let rail_chars = 2 * lanes_n;
+    // id column width: 4-char min prefix plus the `@` literal prefix, and any
+    // overflow of a run count past the rails area
+    let mut id_w = 5usize;
+    for (idx, n) in rows.iter().enumerate() {
+        if let Display::Run { count, .. } = n {
+            if let Some(l) = placements[idx].lane {
+                let digits = format!("{}", count).len();
+                let extra = (2 * l + 1 + digits).saturating_sub(rail_chars);
+                // digits written from 2l+1; rails hold rail_chars; overflow
+                // goes into the id column
+                if extra > 0 {
+                    id_w = id_w.max(4 + extra);
+                }
+            }
+        }
+    }
+    for n in rows {
+        if let Some(c) = n.commit() {
+            id_w = id_w.max(prefix_len(&c.id) + 1); // +1 for the `@`
+        }
+    }
+    let text_off = 2 + rail_chars + 1;
+    let msg_off = text_off + id_w + 2;
+    let label_col = rows
+        .iter()
+        .any(|n| n.commit().map(|c| !c.labels.is_empty()).unwrap_or(false));
+    // build row texts
+    let mut texts: Vec<RowText> = Vec::new();
+    for (idx, n) in rows.iter().enumerate() {
+        let run_extra = match (n, placements[idx].lane) {
+            (Display::Run { count, .. }, Some(l)) => {
+                let digits = format!("{}", count).len();
+                (2 * l + 1 + digits).saturating_sub(rail_chars)
+            }
+            _ => 0,
+        };
+        texts.push(build_row_text(
+            n, rows, opts, pal, with_focus, prefix_len, run_extra, id_w,
+        ));
+    }
+    // right edges for the label and margin columns
+    let mut msg_end_max = 0usize;
+    let mut lab_end_max = 0usize;
+    for (idx, n) in rows.iter().enumerate() {
+        let t = &texts[idx];
+        if n.commit().is_none() {
+            continue;
+        }
+        let mut pos = msg_off;
+        if !t.bar.is_empty() {
+            pos += 1; // the bar takes one extra column before the message
+        }
+        pos += width(&t.msg);
+        if !t.labels.is_empty() {
+            pos += 2 + width(&t.labels);
+        }
+        msg_end_max = msg_end_max.max(pos - if t.labels.is_empty() { 0 } else { 2 + width(&t.labels) });
+        lab_end_max = lab_end_max.max(pos);
+    }
+    let mut lines: Vec<String> = Vec::new();
+    for (idx, n) in rows.iter().enumerate() {
+        let pl = &placements[idx];
+        let t = &texts[idx];
+        let (chars, lane0) = rail_row(rows, placements, idx, lanes_n, opts);
+        let mut line = String::new();
+        line.push_str(&t.gutter);
+        line.push_str(&color_rails(&chars, &lane0, pal));
+        line.push(' ');
+        line.push_str(&t.id);
+        if !t.bar.is_empty() {
+            line.push(' ');
+            line.push_str(&t.bar);
+        }
+        line.push_str("  ");
+        line.push_str(&t.msg);
+        if label_col && !t.labels.is_empty() {
+            let want = 2 + msg_end_max.saturating_sub(width(&t.msg));
+            line.push_str(&" ".repeat(want));
+            line.push_str(&pal.green(&pad_right(&t.labels, width(&t.labels))));
+        }
+        if opts.margin && !t.age.is_empty() {
+            let cur = if label_col && !t.labels.is_empty() {
+                msg_end_max + 2 + width(&t.labels)
+            } else {
+                width(&t.msg)
+            };
+            let want = 2 + lab_end_max.saturating_sub(cur);
+            line.push_str(&" ".repeat(want));
+            line.push_str(&pal.grey(4, &t.age));
+            line.push_str("  ");
+            line.push_str(&pal.author(&t.initials_author, &t.initials));
+        }
+        let _ = pl;
+        lines.push(line);
+        // detail line (detail = 2, focus only)
+        if opts.detail >= 2
+            && with_focus
+            && n.commit().map(|c| c.is_focus && !c.detail_marks.is_empty()).unwrap_or(false)
+        {
+            let c = n.commit().unwrap();
+            let (dchars, dlane0) = detail_rail_row(rows, placements, idx, lanes_n);
+            let mut dline = String::new();
+            dline.push_str("  ");
+            dline.push_str(&color_rails(&dchars, &dlane0, pal));
+            dline.push(' ');
+            dline.push_str(&" ".repeat(id_w + 2));
+            let marks: Vec<String> = c
+                .detail_marks
+                .iter()
+                .map(|(p, m)| {
+                    let ms = m.to_string();
+                    let colored = match m {
+                        '+' => pal.green(&ms),
+                        '−' => pal.red(&ms),
+                        '~' => pal.yellow(&ms),
+                        '✖' => pal.red(&ms),
+                        _ => ms,
+                    };
+                    format!("{} {}", colored, p)
+                })
+                .collect();
+            dline.push_str(&marks.join("   "));
+            lines.push(dline);
+        }
+    }
+    // message truncation to the terminal width (§Step 4)
+    if crate::show::stdout_is_tty() {
+        if let Some(w) = crate::show::terminal_width() {
+            truncate_lines(&mut lines, w, msg_off, label_col, opts.margin);
+        }
+    }
+    // no trailing whitespace on any row
+    for l in lines.iter_mut() {
+        while l.ends_with(' ') {
+            l.pop();
+        }
+    }
+    // Legend (§Legend): explain the symbols that actually appear, faintly, on
+    // the right of the tree if it fits the terminal width, else at the bottom.
+    append_legend(&mut lines, rows, opts, pal);
+    let mut out = lines.join("\n");
+    out.push('\n');
+    Ok(out)
+}
+
+/// Which symbols appear in the rendered tree, used to build the legend. Only
+/// symbols that are actually shown are explained (§Legend option: only-used).
+struct UsedSymbols {
+    glyphs: Vec<&'static str>, // present node glyphs, in legend order
+    run: bool,                 // a ╎ n run row
+    collapsed: bool,           // a ⋯ n collapsed node
+    focus_gutter: bool,        // ▶ present (a focus row exists)
+    detail_marks: Vec<char>,   // + ~ − ✖ present in the focus's detail line
+}
+
+fn collect_used(rows: &[&Display], opts: &TreeOptions, icons: bool) -> UsedSymbols {
+    let mut present: BTreeSet<&'static str> = BTreeSet::new();
+    let mut run = false;
+    let mut collapsed = false;
+    let mut focus_gutter = false;
+    let mut marks: BTreeSet<char> = BTreeSet::new();
+    for n in rows {
+        match n {
+            Display::Run { .. } => run = true,
+            Display::Commit { info, .. } | Display::Collapsed { info, .. } => {
+                // a collapsed node only shows the ⋯ n marker when it hides
+                // descendants; only then is the collapsed symbol used
+                if let Display::Collapsed { hidden, .. } = n {
+                    if *hidden > 0 {
+                        collapsed = true;
+                    }
+                }
+                present.insert(glyph_for(info, icons));
+                if info.is_focus {
+                    focus_gutter = true;
+                    if opts.detail >= 2 {
+                        for (_, m) in &info.detail_marks {
+                            marks.insert(*m);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    // legend glyph order: focus, ancestor, other, immutable, empty, conflict, root
+    const ORDER: [&str; 14] =
+        ["◉", "🌸", "●", "🌿", "○", "🍃", "◆", "🪨", "◌", "🫙", "⊗", "🔥", "⌂", "🌱"];
+    let glyphs = ORDER.iter().filter(|g| present.contains(**g)).copied().collect();
+    UsedSymbols {
+        glyphs,
+        run,
+        collapsed,
+        focus_gutter,
+        detail_marks: marks.into_iter().collect(),
+    }
+}
+
+fn glyph_meaning(g: &str) -> &'static str {
+    match g {
+        "◉" | "🌸" => "focus",
+        "●" | "🌿" => "ancestor of focus",
+        "○" | "🍃" => "other commit",
+        "◆" | "🪨" => "immutable",
+        "◌" | "🫙" => "empty",
+        "⊗" | "🔥" => "conflict",
+        "⌂" | "🌱" => "root",
+        _ => "",
+    }
+}
+
+fn mark_meaning(m: char) -> &'static str {
+    match m {
+        '+' => "added",
+        '~' => "modified",
+        '−' => "deleted",
+        '✖' => "unresolved",
+        _ => "",
+    }
+}
+
+/// Build the legend lines (plain, uncoloured text) for the used symbols.
+fn legend_lines(used: &UsedSymbols) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for g in &used.glyphs {
+        out.push(format!("{} {}", g, glyph_meaning(g)));
+    }
+    if used.focus_gutter {
+        out.push("▶ current commit".to_string());
+    }
+    if used.run {
+        out.push("╎ n run of n commits".to_string());
+    }
+    if used.collapsed {
+        out.push("⋯ n collapsed, n hidden".to_string());
+    }
+    for m in &used.detail_marks {
+        out.push(format!("{} {}", m, mark_meaning(*m)));
+    }
+    out
+}
+
+/// Place the legend. Try the right of the tree: each legend entry is appended,
+/// faint, to the right of a tree row starting one row from the top, past the
+/// widest tree line. If that would exceed the terminal width (or there is no
+/// terminal), put the legend at the bottom instead.
+fn append_legend(lines: &mut Vec<String>, rows: &[&Display], opts: &TreeOptions, pal: &Palette) {
+    let used = collect_used(rows, opts, opts.icons);
+    let entries = legend_lines(&used);
+    if entries.is_empty() {
+        return;
+    }
+    let tree_w = lines.iter().map(|l| width(l)).max().unwrap_or(0);
+    let legend_w = entries.iter().map(|e| width(e)).max().unwrap_or(0);
+    let gap = 4;
+    let right_total = tree_w + gap + legend_w;
+    let tty_width = if crate::show::stdout_is_tty() {
+        crate::show::terminal_width()
+    } else {
+        None
+    };
+    let fits_right = tty_width.map_or(false, |w| right_total <= w);
+    if fits_right {
+        // pad every tree line to tree_w, then append the legend entries dim
+        for l in lines.iter_mut() {
+            let d = width(l);
+            if d < tree_w {
+                l.push_str(&" ".repeat(tree_w - d));
+            }
+        }
+        for (k, e) in entries.iter().enumerate() {
+            if k < lines.len() {
+                lines[k].push_str(&" ".repeat(gap));
+                lines[k].push_str(&pal.dim(e));
+            } else {
+                let mut l = " ".repeat(tree_w + gap);
+                l.push_str(&pal.dim(e));
+                lines.push(l);
+            }
+        }
+    } else {
+        lines.push(String::new());
+        for e in &entries {
+            lines.push(pal.dim(e));
+        }
+    }
+}
+
+/// rails state below row `upto` (exclusive): which lanes hold rails, and which
+/// of those are lane-0
+fn rail_state_below(
+    rows: &[&Display],
+    placements: &[Placement],
+    upto: usize,
+    lanes_n: usize,
+) -> Vec<Option<bool>> {
+    let mut state: Vec<Option<bool>> = vec![None; lanes_n]; // Some(lane==0)
+    for (j, m) in rows.iter().enumerate().take(upto) {
+        let p = &placements[j];
+        if let Some((src, clears)) = p.fork {
+            if clears {
+                state[src] = None;
+            }
+        }
+        if let Some(l) = p.lane {
+            state[l] = if m.children().is_empty() {
+                None
+            } else {
+                Some(l == 0)
+            };
+        }
+        for &(l, _) in &p.reservations {
+            state[l] = Some(false);
+        }
+    }
+    state
+}
+
+/// rails characters for the row of node `idx` (§Step 4, the character table).
+/// Returns the characters and, per character, whether it belongs to lane 0.
+fn rail_row(
+    rows: &[&Display],
+    placements: &[Placement],
+    idx: usize,
+    lanes_n: usize,
+    opts: &TreeOptions,
+) -> (Vec<char>, Vec<bool>) {
+    let n = rows[idx];
+    let pl = &placements[idx];
+    let mut chars = vec![' '; 2 * lanes_n];
+    let mut lane0 = vec![false; 2 * lanes_n];
+    let state = rail_state_below(rows, placements, idx, lanes_n);
+    // horizontal segments: (start, end) in lane coordinates
+    let mut segments: Vec<(usize, usize)> = Vec::new();
+    if let Some((src, _)) = pl.fork {
+        if let Some(tgt) = pl.lane {
+            segments.push((src, tgt));
+        }
+    }
+    if let Some(l) = pl.lane {
+        if let Some(max_r) = pl.reservations.iter().map(|&(l, _)| l).max() {
+            segments.push((l, max_r));
+        }
+    }
+    let in_segment = |i: usize| segments.iter().any(|&(a, b)| a < i && i < b);
+    for i in 0..lanes_n {
+        let c = if Some(i) == pl.lane {
+            match n {
+                Display::Run { .. } => '╎',
+                _ => glyph_for(n.commit().unwrap(), opts.icons)
+                    .chars()
+                    .next()
+                    .unwrap(),
+            }
+        } else if pl.reservations.iter().any(|&(l, _)| l == i) {
+            let right = pl.reservations.iter().any(|&(l, _)| l > i);
+            if right {
+                '┬'
+            } else {
+                '╮'
+            }
+        } else if pl.fork.map(|(src, _)| src == i).unwrap_or(false) {
+            if pl.fork.unwrap().1 {
+                '╰'
+            } else {
+                '├'
+            }
+        } else if in_segment(i) {
+            if state[i].is_some() {
+                '┼'
+            } else {
+                '─'
+            }
+        } else if state[i].is_some() {
+            '│'
+        } else if pl.flattened && i == lanes_n - 1 {
+            '»'
+        } else {
+            ' '
+        };
+        chars[2 * i] = c;
+        lane0[2 * i] = i == 0;
+    }
+    // on a run row the count follows ╎, written into the rails area
+    if let (Display::Run { count, .. }, Some(l)) = (n, pl.lane) {
+        for (k, d) in format!(" {}", count).chars().enumerate() {
+            let pos = 2 * l + 1 + k;
+            if pos < chars.len() {
+                chars[pos] = d;
+                lane0[pos] = l == 0;
+            }
+        }
+    }
+    for i in 0..lanes_n {
+        let inside = segments.iter().any(|&(a, b)| 2 * i + 1 > 2 * a && 2 * i + 1 < 2 * b);
+        if inside {
+            chars[2 * i + 1] = '─';
+            lane0[2 * i + 1] = i == 0;
+        }
+    }
+    (chars, lane0)
+}
+
+/// detail line (§Step 4): `│` in every lane that holds a rail below the focus
+/// row, including the focus's own lane if it has children
+fn detail_rail_row(
+    rows: &[&Display],
+    placements: &[Placement],
+    idx: usize,
+    lanes_n: usize,
+) -> (Vec<char>, Vec<bool>) {
+    let state = rail_state_below(rows, placements, idx + 1, lanes_n);
+    let mut chars = vec![' '; 2 * lanes_n];
+    let mut lane0 = vec![false; 2 * lanes_n];
+    for i in 0..lanes_n {
+        if let Some(is0) = state[i] {
+            chars[2 * i] = '│';
+            lane0[2 * i] = is0;
+        }
+    }
+    (chars, lane0)
+}
+
+fn color_rails(chars: &[char], lane0: &[bool], pal: &Palette) -> String {
+    let mut s = String::new();
+    for (i, c) in chars.iter().enumerate() {
+        let t = c.to_string();
+        if *c == ' ' {
+            s.push(*c);
+        } else if lane0[i] {
+            s.push_str(&pal.blue(&t));
+        } else {
+            s.push_str(&pal.dim(&t));
+        }
+    }
+    s
+}
+
+/// cut the message so labels and the margin keep their columns (§Step 4)
+fn truncate_lines(
+    lines: &mut [String],
+    term_w: usize,
+    msg_off: usize,
+    label_col: bool,
+    margin: bool,
+) {
+    for line in lines.iter_mut() {
+        if width(line) <= term_w {
+            continue;
+        }
+        // find the message span: it starts at msg_off and ends where the
+        // label/margin padding (2+ spaces) begins
+        let plain = strip_ansi(line);
+        if width(&plain) <= term_w {
+            continue;
+        }
+        // walk characters, tracking display column
+        let mut col = 0usize;
+        let mut cut_at: Option<usize> = None;
+        let mut tail_start: Option<usize> = None;
+        let mut prev_two_spaces = 0usize;
+        for (bi, ch) in line.char_indices() {
+            if ch == '\x1b' {
+                // skip escape sequence
+                continue;
+            }
+            let _ = bi;
+            let w = UnicodeWidthChar::width(ch).unwrap_or(0);
+            if col >= msg_off {
+                if ch == ' ' {
+                    prev_two_spaces += 1;
+                } else {
+                    prev_two_spaces = 0;
+                }
+                if prev_two_spaces == 2 && tail_start.is_none() {
+                    tail_start = Some(bi);
+                }
+            }
+            if col + w >= term_w && cut_at.is_none() {
+                cut_at = Some(bi);
+            }
+            col += w;
+        }
+        if !label_col && !margin {
+            continue;
+        }
+        if let (Some(_cut), Some(_tail)) = (cut_at, tail_start) {
+            // recompute on the plain string, then rebuild: this path only
+            // matters on a tty, so keep it simple and operate on plain text
+            let p = strip_ansi(line);
+            let pw = width(&p);
+            if pw <= term_w {
+                continue;
+            }
+            // find message end (last run of 2+ spaces that starts the fixed tail)
+            let bytes = p.as_bytes();
+            let mut tail_bi = p.len();
+            let mut i = 0usize;
+            while i + 1 < bytes.len() {
+                if bytes[i] == b' ' && bytes[i + 1] == b' ' {
+                    // candidate: is everything after this point the fixed tail?
+                    tail_bi = i;
+                }
+                i += 1;
+            }
+            let tail = &p[tail_bi..];
+            let tail_w = width(tail);
+            let head_budget = term_w.saturating_sub(tail_w + 1);
+            let head = &p[..p
+                .char_indices()
+                .take_while(|(_, c)| {
+                    let _ = c;
+                    true
+                })
+                .count()
+                .min(p.len())];
+            let mut head_w = 0usize;
+            let mut head_end = 0usize;
+            for (bi, ch) in head.char_indices() {
+                let cw = UnicodeWidthChar::width(ch).unwrap_or(0);
+                if head_w + cw > head_budget {
+                    break;
+                }
+                head_w += cw;
+                head_end = bi + ch.len_utf8();
+            }
+            let head = head[..head_end].trim_end();
+            *line = format!("{}…{}", head, tail);
+        }
+    }
+}
+
+fn strip_ansi(s: &str) -> String {
+    let mut out = String::new();
+    let mut esc = false;
+    for c in s.chars() {
+        if esc {
+            if c == 'm' {
+                esc = false;
+            }
+            continue;
+        }
+        if c == '\x1b' {
+            esc = true;
+            continue;
+        }
+        out.push(c);
+    }
+    out
 }
 
 fn glyph_for(info: &CommitInfo, icons: bool) -> &'static str {
@@ -1133,127 +2231,4 @@ fn initials(name: &str) -> String {
         .take(2)
         .collect::<String>()
         .to_lowercase()
-}
-
-#[allow(clippy::too_many_arguments)]
-fn render_node(
-    info: &CommitInfo,
-    opts: &TreeOptions,
-    pal: &Palette,
-    prefix: &str,
-    last: bool,
-    is_root: bool,
-    label_col: bool,
-    lines: &mut Vec<String>,
-) {
-    let gutter = if info.is_focus { "▶ " } else { "  " };
-    let rail = if is_root {
-        ""
-    } else if last {
-        "└─ "
-    } else {
-        "├─ "
-    };
-    let glyph = glyph_for(info, opts.icons);
-    // id: shortest unique prefix, min 4 — needs backend; caller passes
-    // preformatted? We keep full id short form here via stored prefix.
-    let id_disp = info_display_id(info, pal);
-    let bar = if opts.detail >= 1 {
-        // focus and parent and children at detail 1; all at 2
-        if opts.detail >= 2 || info.is_focus {
-            size_bar(info.size, pal)
-        } else {
-            size_bar(info.size, pal)
-        }
-    } else {
-        String::new()
-    };
-    let msg_first = info.message.lines().next().unwrap_or("");
-    let msg = if info.empty {
-        pal.dim_italic(msg_first)
-    } else if info.is_focus {
-        msg_first.to_string()
-    } else if !info.is_ancestor_of_focus {
-        msg_first.to_string()
-    } else {
-        msg_first.to_string()
-    };
-    let mut line = format!("{}{}{} {} {}", gutter, prefix, rail, glyph, id_disp);
-    if !bar.is_empty() {
-        line.push_str(&format!(" {}", bar));
-    }
-    if !msg.is_empty() {
-        line.push_str(&format!("  {}", msg));
-    }
-    if label_col && !info.labels.is_empty() {
-        line.push_str(&format!("  {}", pal.green(&info.labels.join("  "))));
-    }
-    if opts.margin {
-        if let Some(meta) = &info.meta {
-            let age = render_age(meta.time);
-            let init = initials(&meta.author);
-            line.push_str(&format!("  {}  {}", pal.grey(4, &age), pal.author(&meta.author, &init)));
-        }
-    }
-    lines.push(line);
-    // detail line (detail = 2, focus only)
-    if opts.detail >= 2 && info.is_focus && !info.detail_marks.is_empty() {
-        let cont = if is_root { "     " } else if last { "      " } else { "│     " };
-        let marks: Vec<String> = info
-            .detail_marks
-            .iter()
-            .map(|(p, m)| {
-                let ms = m.to_string();
-                let c = match m {
-                    '+' => pal.green(&ms),
-                    '−' => pal.red(&ms),
-                    '~' => pal.yellow(&ms),
-                    '✖' => pal.red(&ms),
-                    _ => ms,
-                };
-                format!("{} {}", c, p)
-            })
-            .collect();
-        lines.push(format!("  {}{}{}", prefix, cont, marks.join("   ")));
-    }
-    let child_prefix = if is_root {
-        String::new()
-    } else if last {
-        format!("{}   ", prefix)
-    } else {
-        format!("{}│  ", prefix)
-    };
-    let n = info.children.len();
-    for (i, c) in info.children.iter().enumerate() {
-        render_node(c, opts, pal, &child_prefix, i == n - 1, false, label_col, lines);
-    }
-}
-
-fn info_display_id(info: &CommitInfo, pal: &Palette) -> String {
-    // prefix is precomputed into the commit id string by the caller when a
-    // backend is available; here we use the first 4 chars as the unique part
-    let id = &info.id;
-    let n = 4.min(id.len());
-    let p = &id[..n];
-    let rest = &id[n..];
-    let _ = rest;
-    if info.conflict {
-        pal.red(p)
-    } else if info.immutable {
-        pal.blue(p)
-    } else {
-        p.to_string()
-    }
-}
-
-/// A reference to a commit that may or may not have stored metadata.
-/// Minted commits (dry runs) carry no metadata (§7.11).
-pub struct MetaLookup<'a> {
-    pub interp: &'a Interp,
-}
-
-impl<'a> MetaLookup<'a> {
-    pub fn get(&self, id: &str) -> Option<crate::domain::MetaInfo> {
-        self.interp.backend.meta(id).ok()
-    }
 }

@@ -153,7 +153,8 @@ validate   : Repo -> Repo                  -- the repo unchanged, or the crash p
 diff       : Blob -> Blob -> Text          -- unified diff from the first to the second
 difft      : Path -> Blob -> Blob -> Text  -- difftastic's rendering; needs difft on PATH.
                                            -- Options via DFT_* environment variables.
-treeWith   : { detail : Int, margin : Bool, elide : Bool, icons : Bool, color : Text }
+treeWith   : { detail : Int, margin : Bool, elide : Bool, icons : Bool, color : Text
+             , lanes : Int }
              -> Repo -> Text              -- the history as a tree; see the spec
 
 -- Every subvalue of a given shape, however deeply nested. A shape is a type
@@ -569,8 +570,13 @@ log = \repo ->
 
 -- The history as a tree. Edit these records to change what `j tree` shows.
 -- (The parentheses are required: `f { … }` would be a record update of f.)
+-- The default `tree` shows every commit, sorted by time (parents always above
+-- their children); `treeCompact` folds uninteresting runs and far subtrees.
 tree : Repo -> Text
-tree = treeWith ({ detail = 1, margin = false, elide = true,  icons = false, color = "auto" })
+tree = treeWith ({ detail = 1, margin = false, elide = false, icons = false, color = "auto", lanes = 4 })
+
+treeCompact : Repo -> Text
+treeCompact = treeWith ({ detail = 1, margin = false, elide = true,  icons = false, color = "auto", lanes = 4 })
 
 treeFull : Repo -> Text
-treeFull = treeWith ({ detail = 2, margin = true,  elide = false, icons = false, color = "auto" })
+treeFull = treeWith ({ detail = 2, margin = true,  elide = false, icons = false, color = "auto", lanes = 4 })

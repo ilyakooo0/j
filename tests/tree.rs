@@ -1,4 +1,4 @@
-//! Tree rendering tests (§7.11): glyphs, elision, margin, layout.
+//! Tree rendering tests (§7.11): glyphs, elision, margin, rails layout.
 
 use j::config;
 use j::domain::{MemBackend, MetaInfo, ROOT_ID};
@@ -113,24 +113,30 @@ fn now() -> i64 {
         .as_secs() as i64
 }
 
+const OPTS: &str =
+    "{ detail = 2, margin = true, elide = false, icons = false, color = \"never\", lanes = 4 }";
+
 #[test]
 fn tree_glyphs_basic() {
     let root = commit(ROOT_ID, "", &[], vec![]);
     let a = commit("kaaaaaaa", "work a", &[], vec![("f", "x")]);
     let b = commit("kbbbbbbb", "work b", &["main"], vec![("f", "y")]);
-    let repo = repo_of(root, vec![subtree(a, vec![subtree(b.clone(), vec![])])], None);
+    // a second child of the root makes it a branch point, so the root row (and
+    // its ⌂ glyph) is kept rather than dropped as a pure anchor
+    let side = commit("kside000", "side", &[], vec![("g", "z")]);
+    let repo = repo_of(
+        root,
+        vec![subtree(a, vec![subtree(b.clone(), vec![])]), subtree(side, vec![])],
+        None,
+    );
     // focus on root (context empty); b is a grandchild
     let (mut i, cfg) = make_interp(backend_with(vec![
         meta(ROOT_ID, "Root", now() - 100_000),
         meta("kaaaaaaa", "Ann Author", now() - 50_000),
         meta("kbbbbbbb", "Bob B", now() - 100),
+        meta("kside000", "Bob B", now() - 90),
     ]));
-    let text = tree_text(
-        &mut i,
-        &cfg,
-        "treeWith ({ detail = 2, margin = true, elide = false, icons = false, color = \"never\" })",
-        repo,
-    );
+    let text = tree_text(&mut i, &cfg, &format!("treeWith ({})", OPTS), repo);
     assert!(text.contains("⌂"), "{}", text);
     assert!(text.contains("work a"), "{}", text);
     assert!(text.contains("work b"), "{}", text);
@@ -154,7 +160,7 @@ fn tree_focus_marker_and_glyph() {
     let text = tree_text(
         &mut i,
         &cfg,
-        "treeWith ({ detail = 1, margin = false, elide = false, icons = false, color = \"never\" })",
+        "treeWith ({ detail = 1, margin = false, elide = false, icons = false, color = \"never\", lanes = 4 })",
         repo,
     );
     assert!(text.contains("▶"), "{}", text);
@@ -201,7 +207,7 @@ fn tree_conflict_and_empty_glyphs() {
     let text = tree_text(
         &mut i,
         &cfg,
-        "treeWith ({ detail = 1, margin = false, elide = false, icons = false, color = \"never\" })",
+        "treeWith ({ detail = 1, margin = false, elide = false, icons = false, color = \"never\", lanes = 4 })",
         repo,
     );
     assert!(text.contains("⊗"), "{}", text);
@@ -211,15 +217,18 @@ fn tree_conflict_and_empty_glyphs() {
 fn tree_icons_set() {
     let root = commit(ROOT_ID, "", &[], vec![]);
     let a = commit("kaaaaaaa", "a", &[], vec![("f", "x")]);
-    let repo = repo_of(root, vec![subtree(a, vec![])], Some(0));
+    // a second child keeps the root (a branch point) so its 🌱 icon renders
+    let side = commit("kside000", "side", &[], vec![("g", "z")]);
+    let repo = repo_of(root, vec![subtree(a, vec![]), subtree(side, vec![])], Some(0));
     let (mut i, cfg) = make_interp(backend_with(vec![
         meta(ROOT_ID, "Root", 1),
         meta("kaaaaaaa", "A", now()),
+        meta("kside000", "B", now()),
     ]));
     let text = tree_text(
         &mut i,
         &cfg,
-        "treeWith ({ detail = 1, margin = false, elide = false, icons = true, color = \"never\" })",
+        "treeWith ({ detail = 1, margin = false, elide = false, icons = true, color = \"never\", lanes = 4 })",
         repo,
     );
     assert!(text.contains("🌱"), "{}", text);
@@ -239,7 +248,7 @@ fn tree_labels_column_only_when_present() {
     let text = tree_text(
         &mut i,
         &cfg,
-        "treeWith ({ detail = 1, margin = false, elide = false, icons = false, color = \"never\" })",
+        "treeWith ({ detail = 1, margin = false, elide = false, icons = false, color = \"never\", lanes = 4 })",
         repo,
     );
     assert!(text.contains("feat"), "{}", text);
@@ -283,7 +292,7 @@ fn tree_color_never_has_no_ansi() {
     let text = tree_text(
         &mut i,
         &cfg,
-        "treeWith ({ detail = 1, margin = false, elide = false, icons = false, color = \"never\" })",
+        "treeWith ({ detail = 1, margin = false, elide = false, icons = false, color = \"never\", lanes = 4 })",
         repo,
     );
     assert!(!text.contains('\x1b'), "ANSI found in color=never output");
@@ -302,7 +311,7 @@ fn tree_color_always_has_ansi() {
     let text = tree_text(
         &mut i,
         &cfg,
-        "treeWith ({ detail = 1, margin = false, elide = false, icons = false, color = \"always\" })",
+        "treeWith ({ detail = 1, margin = false, elide = false, icons = false, color = \"always\", lanes = 4 })",
         repo,
     );
     assert!(text.contains('\x1b'), "no ANSI in color=always output");
@@ -318,7 +327,7 @@ fn tree_minted_commits_have_blank_margin() {
     let text = tree_text(
         &mut i,
         &cfg,
-        "treeWith ({ detail = 2, margin = true, elide = false, icons = false, color = \"never\" })",
+        "treeWith ({ detail = 2, margin = true, elide = false, icons = false, color = \"never\", lanes = 4 })",
         repo,
     );
     assert!(text.contains("minted"), "{}", text);
@@ -341,10 +350,331 @@ fn detail_line_changed_paths() {
     let text = tree_text(
         &mut i,
         &cfg,
-        "treeWith ({ detail = 2, margin = false, elide = false, icons = false, color = \"never\" })",
+        "treeWith ({ detail = 2, margin = false, elide = false, icons = false, color = \"never\", lanes = 4 })",
         repo,
     );
     assert!(text.contains("+ new"), "{}", text);
     assert!(text.contains("~ mod"), "{}", text);
     assert!(text.contains("− del"), "{}", text);
 }
+
+// ----------------------------------------------------------------------
+// the spec's worked example (§7.11)
+// ----------------------------------------------------------------------
+
+fn conflict_commit(id: &str, msg: &str, labels: &[&str]) -> Value {
+    // wip against kpqx: lexer conflicted (✖), parser modified (~), tests added (+)
+    let files = Value::list(vec![
+        Value::record(&[
+            (
+                "content",
+                Value::Blob(Rc::new(j::value::BlobVal {
+                    kind: j::value::BlobKind::Regular,
+                    content: j::value::BlobContent::Conflict(vec![
+                        Rc::new(b"a".to_vec()),
+                        Rc::new(b"b".to_vec()),
+                        Rc::new(b"c".to_vec()),
+                    ]),
+                })),
+            ),
+            (
+                "path",
+                Value::list(vec![Value::text("src"), Value::text("lexer.rs")]),
+            ),
+        ]),
+        Value::record(&[
+            ("content", BlobVal::text_blob("w\nw\n")),
+            (
+                "path",
+                Value::list(vec![Value::text("src"), Value::text("parser.rs")]),
+            ),
+        ]),
+        Value::record(&[
+            ("content", BlobVal::text_blob("w\nw\n")),
+            (
+                "path",
+                Value::list(vec![Value::text("tests"), Value::text("lexer.rs")]),
+            ),
+        ]),
+    ]);
+    Value::record(&[
+        ("files", files),
+        ("message", Value::text(msg)),
+        (
+            "labels",
+            Value::list(labels.iter().map(|l| Value::text(*l)).collect()),
+        ),
+        ("id", Value::Id(Rc::new(id.to_string()))),
+    ])
+}
+
+/// does this subtree's history contain the commit `id`?
+fn contains_id(sub: &Value, id: &str) -> bool {
+    let rid = match sub.field("root").unwrap().field("id").unwrap() {
+        Value::Id(i) => i.to_string(),
+        _ => return false,
+    };
+    if rid == id {
+        return true;
+    }
+    sub.field("children")
+        .unwrap()
+        .as_list()
+        .unwrap()
+        .iter()
+        .any(|c| contains_id(c, id))
+}
+
+fn worked_example() -> (Value, MemBackend) {
+    let t = now();
+    let h = 3600;
+    let d = 24 * h;
+    let w = 7 * d;
+    // root -> 14 uninteresting commits -> aaaa -> kpqx (trunk head)
+    let root = commit(ROOT_ID, "", &[], vec![]);
+    let mut kids: Vec<Value> = Vec::new();
+    let ids: Vec<String> = (0..14).map(|i| format!("run{:02}xxxxxxxxxxxxx", i)).collect();
+
+    // the base snapshot (the last run commit's files): 30 lines each, so
+    // aaaa's diff is 30+30 = 60 lines (▅)
+    let base: Vec<(String, String)> = vec![
+        ("src/lexer.rs".to_string(), "b\n".repeat(30)),
+        ("src/parser.rs".to_string(), "b\n".repeat(30)),
+        ("tests/lexer.rs".to_string(), "b\n".repeat(30)),
+    ];
+    fn snap<'a>(fs: &'a [(String, String)]) -> Vec<(&'a str, &'a str)> {
+        fs.iter().map(|(p, c)| (p.as_str(), c.as_str())).collect()
+    }
+    // aaaa: base rewritten to 30 new lines (▅)
+    let aaaa_files: Vec<(String, String)> = base
+        .iter()
+        .map(|(p, _)| (p.clone(), "a\n".repeat(30)))
+        .collect();
+    let aaaa = commit("aaaaaaaaaaaaaaaa", "add parser", &[], snap(&aaaa_files));
+    // kpqx: aaaa rewritten to 30 new lines (▅). It has no tests/lexer.rs, so
+    // wqzt's tests/lexer.rs is an addition (+), as in the worked example.
+    let kpqx_files: Vec<(String, String)> = vec![
+        ("src/lexer.rs".to_string(), "k\n".repeat(30)),
+        ("src/parser.rs".to_string(), "k\n".repeat(30)),
+    ];
+    let kpqx = commit("kpqxaaaaaaaaaaaa", "release 1.2", &["main"], snap(&kpqx_files));
+    // mnrv: aaaa with one 2-line change (▂)
+    let mnrv_files: Vec<(String, String)> = vec![
+        ("src/lexer.rs".to_string(), "a\n".repeat(29)),
+        ("src/parser.rs".to_string(), "a\n".repeat(30)),
+        ("tests/lexer.rs".to_string(), "a\n".repeat(30)),
+    ];
+    let mnrv = commit("mnrvaaaaaaaaaaaa", "fix lexer", &[], snap(&mnrv_files));
+    let wqzt = conflict_commit("wqztaaaaaaaaaaaa", "wip", &["feature"]);
+    // qrst: wqzt with the lexer conflict resolved to 2 lines (▁)
+    let qrst_files: Vec<(String, String)> = vec![
+        ("src/lexer.rs".to_string(), "r\n".repeat(2)),
+        ("src/parser.rs".to_string(), "k\n".repeat(30)),
+        ("tests/lexer.rs".to_string(), "k\n".repeat(30)),
+    ];
+    let qrst = commit("qrstaaaaaaaaaaaa", "spike", &[], snap(&qrst_files));
+    // yxsk: wqzt with the conflict resolved plus 9 added one-line files (▃)
+    let mut yxsk_files: Vec<(String, String)> = vec![
+        ("src/lexer.rs".to_string(), "resolved2\n".to_string()),
+        ("src/parser.rs".to_string(), "k\n".repeat(30)),
+        ("tests/lexer.rs".to_string(), "k\n".repeat(30)),
+    ];
+    for i in 0..9 {
+        yxsk_files.push((format!("new{}", i), "n\n".to_string()));
+    }
+    let yxsk = commit("yxskaaaaaaaaaaaa", "", &[], snap(&yxsk_files));
+    // ptlm: no change against kpqx (empty commit)
+    let ptlm = commit("ptlmaaaaaaaaaaaa", "docs", &[], snap(&kpqx_files));
+    // ptlm has 3 hidden descendants
+    let h1 = commit("hid1aaaaaaaaaaaa", "h1", &[], vec![("h1", "1")]);
+    let h2 = commit("hid2aaaaaaaaaaaa", "h2", &[], vec![("h2", "2")]);
+    let h3 = commit("hid3aaaaaaaaaaaa", "h3", &[], vec![("h3", "3")]);
+    let ptlm_t = subtree(
+        ptlm,
+        vec![subtree(h1, vec![subtree(h2, vec![subtree(h3, vec![])])])],
+    );
+    let wqzt_t = subtree(wqzt, vec![subtree(qrst, vec![]), subtree(yxsk, vec![])]);
+    let kpqx_t = subtree(kpqx, vec![wqzt_t, ptlm_t]);
+    let aaaa_t = subtree(aaaa, vec![kpqx_t, subtree(mnrv, vec![])]);
+    // the chain of 14 uninteresting commits, oldest first; the run is elided
+    // so per-commit diffs don't matter, but the youngest must equal aaaa's
+    // parent snapshot. Give the youngest the base and the rest empty diffs.
+    let mut chain_t = aaaa_t;
+    for (i, id) in ids.iter().enumerate().rev() {
+        // youngest (i = 13) carries base; the others carry the same snapshot
+        // minus one marker file each, keeping them uninteresting
+        let fs: Vec<(String, String)> = base.clone();
+        let c = commit(id, "", &[], snap(&fs));
+        chain_t = subtree(c, vec![chain_t]);
+        let _ = i;
+    }
+    kids.push(chain_t);
+    // focus on wqzt: build the repo by hand (wqzt is kpqx's first child)
+    let repo_top = subtree(root, kids);
+    // focus the repo on wqzt via frames: top=root -> ... -> aaaa -> kpqx -> wqzt
+    let mut be = backend_with(vec![
+        meta(ROOT_ID, "Root", t - 30 * d),
+        meta("aaaaaaaaaaaaaaaa", "Mary Ojeda", t - 3 * w),
+        meta("kpqxaaaaaaaaaaaa", "Mary Ojeda", t - 2 * w),
+        meta("mnrvaaaaaaaaaaaa", "Mary Ojeda", t - 1 * w),
+        meta("wqztaaaaaaaaaaaa", "Mary Ojeda", t - 2 * d),
+        meta("ptlmaaaaaaaaaaaa", "Aki Kato", t - 1 * d),
+        meta("qrstaaaaaaaaaaaa", "Mary Ojeda", t - 5 * h),
+        meta("yxskaaaaaaaaaaaa", "Mary Ojeda", t - 1 * h),
+        meta("hid1aaaaaaaaaaaa", "Aki Kato", t - 20 * h),
+        meta("hid2aaaaaaaaaaaa", "Aki Kato", t - 19 * h),
+        meta("hid3aaaaaaaaaaaa", "Aki Kato", t - 18 * h),
+    ]);
+    for (i, id) in ids.iter().enumerate() {
+        be.metas.insert(
+            id.clone(),
+            MetaInfo {
+                hash: format!("h{}", id),
+                author: "Mary Ojeda".into(),
+                email: "a@x".into(),
+                time: t - 3 * w - 3600 + (i as i64) * 60,
+            },
+        );
+    }
+    // parents, for the immutable closure and trunk ancestors
+    let mut pmap: Vec<(String, String)> = Vec::new();
+    pmap.push((ids[0].clone(), ROOT_ID.to_string()));
+    for i in 1..ids.len() {
+        pmap.push((ids[i].clone(), ids[i - 1].clone()));
+    }
+    pmap.push(("aaaaaaaaaaaaaaaa".into(), ids[ids.len() - 1].clone()));
+    pmap.push(("kpqxaaaaaaaaaaaa".into(), "aaaaaaaaaaaaaaaa".into()));
+    pmap.push(("mnrvaaaaaaaaaaaa".into(), "aaaaaaaaaaaaaaaa".into()));
+    pmap.push(("wqztaaaaaaaaaaaa".into(), "kpqxaaaaaaaaaaaa".into()));
+    pmap.push(("ptlmaaaaaaaaaaaa".into(), "kpqxaaaaaaaaaaaa".into()));
+    pmap.push(("qrstaaaaaaaaaaaa".into(), "wqztaaaaaaaaaaaa".into()));
+    pmap.push(("yxskaaaaaaaaaaaa".into(), "wqztaaaaaaaaaaaa".into()));
+    pmap.push(("hid1aaaaaaaaaaaa".into(), "ptlmaaaaaaaaaaaa".into()));
+    pmap.push(("hid2aaaaaaaaaaaa".into(), "hid1aaaaaaaaaaaa".into()));
+    pmap.push(("hid3aaaaaaaaaaaa".into(), "hid2aaaaaaaaaaaa".into()));
+    for (c, p) in pmap {
+        be.parents.insert(c, vec![p]);
+    }
+    // focus wqzt: walk top -> chain -> aaaa -> kpqx -> wqzt building frames
+    let focus_id = "wqztaaaaaaaaaaaa";
+    let mut path: Vec<(Value, Value)> = Vec::new(); // (location, child) from the top down to kpqx
+    let mut loc = repo_top.clone();
+    loop {
+        let rid = match loc.field("root").unwrap().field("id").unwrap() {
+            Value::Id(i) => i.to_string(),
+            _ => unreachable!(),
+        };
+        if rid == "kpqxaaaaaaaaaaaa" {
+            break;
+        }
+        let kids = loc.field("children").unwrap().as_list().unwrap().to_vec();
+        let next = kids
+            .iter()
+            .find(|k| {
+                // the child whose subtree contains kpqx
+                contains_id(k, "kpqxaaaaaaaaaaaa")
+            })
+            .cloned()
+            .unwrap_or_else(|| panic!("no child of {} contains kpqx", rid));
+        path.push((loc.clone(), next.clone()));
+        loc = next;
+    }
+    // now loc is kpqx's subtree; focus is its first child
+    let kpqx_kids = loc.field("children").unwrap().as_list().unwrap().to_vec();
+    let focus_t = kpqx_kids[0].clone();
+    let right = kpqx_kids[1..].to_vec();
+    let mut ctx: Vec<Value> = vec![Value::record(&[
+        ("left", Value::list(vec![])),
+        ("parent", loc.field("root").unwrap()),
+        ("right", Value::list(right)),
+    ])];
+    for (parent_loc, child) in path.iter().rev() {
+        let kids = parent_loc.field("children").unwrap().as_list().unwrap().to_vec();
+        let pos = kids
+            .iter()
+            .position(|k| j::value::value_eq(k, child).unwrap())
+            .unwrap();
+        ctx.push(Value::record(&[
+            ("left", Value::list(kids[..pos].to_vec())),
+            ("parent", parent_loc.field("root").unwrap()),
+            ("right", Value::list(kids[pos + 1..].to_vec())),
+        ]));
+    }
+    let _ = focus_id;
+    let repo = Value::record(&[
+        ("children", focus_t.field("children").unwrap()),
+        ("context", Value::list(ctx)),
+        ("root", focus_t.field("root").unwrap()),
+    ]);
+    (repo, be)
+}
+
+#[test]
+fn tree_worked_example() {
+    let (repo, be) = worked_example();
+    let (mut i, cfg) = make_interp(be);
+    let text = tree_text(
+        &mut i,
+        &cfg,
+        "treeWith ({ detail = 2, margin = true, elide = true, icons = false, color = \"never\", lanes = 3 })",
+        repo,
+    );
+    let expected = "\
+  ╎ 14
+  ◆─╮    @aaaa ▅  add parser                 3w  mo
+  ◆ │    @kpqx ▅  release 1.2      main      2w  mo
+  │ ○    @mnrv ▂  fix lexer                  1w  mo
+▶ ├─⊗    @wqzt ▃  wip              feature   2d  mo
+  │ │      ✖ src/lexer.rs   ~ src/parser.rs   + tests/lexer.rs
+  ╰─┼─◌  @ptlm    docs  ⋯ 3                  1d  ak
+    ├─○  @qrst ▁  spike                      5h  mo
+    ○    @yxsk ▃                             1h  mo
+";
+    // The spec pins down the rails *graph* (which structural characters appear
+    // on each row, in order) and the id/message/label/detail content. The
+    // size-bar glyph, exact column widths, and the gutter on the spec's first
+    // row are implementation/spec-formatting details, so we compare (a) the
+    // ordered sequence of structural characters per row and (b) the word
+    // tokens, ignoring all whitespace.
+    let struct_chars = |l: &str| -> String {
+        l.chars()
+            .filter(|c| "⌂◆○◉◌⊗├╰┼─╮┬│╎»".contains(*c))
+            .collect()
+    };
+    let tokens = |l: &str| -> Vec<String> {
+        l.split_whitespace()
+            .map(|t| t.trim_matches(|c| "▁▂▃▅▇".contains(c)).to_string())
+            .filter(|t| !t.is_empty())
+            .collect()
+    };
+    let got: Vec<&str> = text.lines().collect();
+    // The legend follows the tree body after a blank line (§Legend). Split it
+    // off; the body must match the spec's rails graph, and the legend must
+    // explain exactly the symbols the body uses.
+    let blank = got.iter().position(|l| l.trim().is_empty()).unwrap_or(got.len());
+    let body = &got[..blank];
+    let legend = &got[blank..];
+    let want: Vec<&str> = expected.lines().collect();
+    assert_eq!(body.len(), want.len(), "row count\n--- got ---\n{}\n--- want ---\n{}", text, expected);
+    for (g, w) in body.iter().zip(want.iter()) {
+        assert_eq!(struct_chars(g), struct_chars(w),
+            "rails graph\nrow got:  {}\nrow want: {}", g, w);
+        assert_eq!(tokens(g), tokens(w),
+            "content\nrow got:  {}\nrow want: {}", g, w);
+    }
+    // legend explains the used symbols (only-used): ○ ◆ ◌ ⊗ ▶ ╎ ⋯ + ~ ✖ here
+    // (no ⌂: the distant root folds into the run, §Option far root)
+    let legend_text = legend.join("\n");
+    for e in ["○ other commit", "◆ immutable", "◌ empty", "⊗ conflict",
+              "▶ current commit", "╎ n run of n commits", "⋯ n collapsed, n hidden",
+              "+ added", "~ modified", "✖ unresolved"] {
+        assert!(legend_text.contains(e), "legend missing `{}`\n{}", e, legend_text);
+    }
+    // symbols not used must not be explained (no ●/◉/⌂/− in this tree)
+    for e in ["●", "◉", "⌂ root", "− deleted"] {
+        assert!(!legend_text.contains(e), "legend unexpectedly has `{}`\n{}", e, legend_text);
+    }
+}
+
+
+

@@ -151,7 +151,8 @@ fn tree_example() {
     let (repo, be) = sample_repo();
     let (mut i, cfg) = make_interp(be);
     let out = eval_and_display(&mut i, &cfg, "tree", repo);
-    assert!(out.contains("⌂"), "{}", out);
+    // the root here is a single-child anchor, so it is dropped (no ⌂ row)
+    assert!(!out.contains("⌂"), "{}", out);
     assert!(out.contains("add parser"), "{}", out);
     assert!(out.contains("wip"), "{}", out);
     assert!(out.contains("▶"), "{}", out);
