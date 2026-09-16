@@ -72,6 +72,33 @@ fn text_literals_and_escapes() {
 }
 
 #[test]
+fn single_quoted_text_literals() {
+    // single quotes are an alternative delimiter with the same escapes
+    assert_eq!(toks("'hello'"), vec![Tok::Text("hello".into())]);
+    // an unescaped " is fine inside single quotes
+    assert_eq!(toks(r#"'say "hi"'"#), vec![Tok::Text("say \"hi\"".into())]);
+    // an unescaped ' is fine inside double quotes
+    assert_eq!(toks("\"don't\""), vec![Tok::Text("don't".into())]);
+    // \' escapes the single quote
+    assert_eq!(toks(r"'don\'t'"), vec![Tok::Text("don't".into())]);
+    // \" works in single-quoted literals too
+    assert_eq!(toks(r#"'a\"b'"#), vec![Tok::Text("a\"b".into())]);
+    // other escapes work the same
+    assert_eq!(toks(r"'\n\t\r\\'"), vec![Tok::Text("\n\t\r\\".into())]);
+    // empty
+    assert_eq!(toks("''"), vec![Tok::Text("".into())]);
+    // errors
+    assert!(err("'unterminated").contains("unterminated"));
+    assert!(err("'a\nb'").contains("newline"));
+    assert!(err(r"'\x'").contains("escape"));
+    // adjacent strings are two tokens (application), not one string
+    assert_eq!(
+        toks("'it' 's'"),
+        vec![Tok::Text("it".into()), Tok::Text("s".into())]
+    );
+}
+
+#[test]
 fn id_literals() {
     assert_eq!(toks("@wqzt"), vec![Tok::IdLit("wqzt".into())]);
     assert_eq!(toks("@kpqxmnrv"), vec![Tok::IdLit("kpqxmnrv".into())]);

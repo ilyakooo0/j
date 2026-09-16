@@ -173,7 +173,9 @@ same value if they have the same field names with equal values.
 - **Type names.** `[A-Z][A-Za-z0-9_]*`. Declared as shapes in `config.j`;
   usable in expressions as values (§4.12).
 - **Integer literals.** `[0-9]+`. There is no unary minus; write `0 - 1`.
-- **Text literals.** `"…"` with escapes `\"`, `\\`, `\n`, `\t`, `\r`.
+- **Text literals.** `"…"` or `'…'` with escapes `\"`, `\'`, `\\`, `\n`,
+  `\t`, `\r`. The closing quote matches the opening one, so a single-quoted
+  literal may contain unescaped `"` and a double-quoted one unescaped `'`.
 - **Id literals.** `@` immediately followed by one or more of the letters
   `k`–`z` (jj's change-id alphabet), e.g. `@wqzt`: an existing id, given in
   full or by a unique prefix.

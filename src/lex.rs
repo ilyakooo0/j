@@ -265,8 +265,9 @@ pub fn lex(src: &str) -> Result<Vec<SpTok>, LexError> {
             push!(Tok::LabelLit(s), start_line, start_col);
             continue;
         }
-        // text literal
-        if c == '"' {
+        // text literal, double- or single-quoted
+        if c == '"' || c == '\'' {
+            let quote = c;
             i += 1;
             col += 1;
             let mut s = String::new();
@@ -275,12 +276,12 @@ pub fn lex(src: &str) -> Result<Vec<SpTok>, LexError> {
                     err!("unterminated text literal");
                 }
                 let d = chars[i];
+                if d == quote {
+                    i += 1;
+                    col += 1;
+                    break;
+                }
                 match d {
-                    '"' => {
-                        i += 1;
-                        col += 1;
-                        break;
-                    }
                     '\\' => {
                         if i + 1 >= chars.len() {
                             err!("unterminated text literal");
@@ -288,6 +289,7 @@ pub fn lex(src: &str) -> Result<Vec<SpTok>, LexError> {
                         let e = chars[i + 1];
                         let r = match e {
                             '"' => '"',
+                            '\'' => '\'',
                             '\\' => '\\',
                             'n' => '\n',
                             't' => '\t',

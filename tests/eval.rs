@@ -227,8 +227,17 @@ fn label_literals_are_revsets() {
 }
 
 #[test]
-fn path_literals_are_text_lists() {
+fn single_quoted_text() {
     let (mut i, cfg) = make_interp();
+    check!(i, cfg, "'hello'", Value::text("hello"));
+    check!(i, cfg, "'say \"hi\"'", Value::text("say \"hi\""));
+    check!(i, cfg, "\"don't\"", Value::text("don't"));
+    check!(i, cfg, "'a' ++ 'b'", Value::text("ab"));
+    check!(i, cfg, "'x' == \"x\"", Value::Bool(true));
+}
+
+#[test]
+fn path_literals_are_text_lists() {    let (mut i, cfg) = make_interp();
     check!(
         i,
         cfg,
