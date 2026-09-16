@@ -18,12 +18,16 @@ columns are at fixed positions, independent of how deep a commit is.
 , elide  : Bool     -- fold uninteresting runs and collapse far subtrees
 , icons  : Bool     -- pictographic glyph set
 , color  : Text     -- "auto", "always", "never"
-, lanes  : Int }    -- lane columns, including the trunk lane; ≥ 1
+, lanes  : Int      -- lane columns, including the trunk lane; ≥ 1
+, author : Bool     -- full author name column
+, date   : Bool     -- absolute commit date column (YYYY-MM-DD)
+, files  : Bool }   -- number of files changed column
 ```
 
 Missing fields crash. `lanes` is the *fixed* width of the rails area in
 lanes; it does not adapt to the history (see §Overflow). The reference
-`config.j` sets `lanes = 4`.
+`config.j` sets `lanes = 4`. The `author`, `date`, and `files` columns are off
+by default; `treeData` enables all three.
 
 #### Trunk
 
@@ -155,6 +159,10 @@ Columns, left to right, at fixed offsets:
    a label; names separated by two spaces.
 8. **Margin** (`margin = true`): age and author initials, right-aligned, as
    before.
+9. **Data columns** (off unless enabled): `date` shows the commit's absolute
+   date `YYYY-MM-DD`; `files` shows the number of files changed as `n files`;
+   `author` shows the full author name. They appear in that order, grey,
+   immediately before the margin in the same right-aligned block.
 
 Columns 4–8 start at the same offset on every row. When stdout is a terminal
 and a row would exceed its width, the message is cut and ends with `…` so that

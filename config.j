@@ -154,7 +154,7 @@ diff       : Blob -> Blob -> Text          -- unified diff from the first to the
 difft      : Path -> Blob -> Blob -> Text  -- difftastic's rendering; needs difft on PATH.
                                            -- Options via DFT_* environment variables.
 treeWith   : { detail : Int, margin : Bool, elide : Bool, icons : Bool, color : Text
-             , lanes : Int }
+             , lanes : Int, author : Bool, date : Bool, files : Bool }
              -> Repo -> Text              -- the history as a tree; see the spec
 
 -- Every subvalue of a given shape, however deeply nested. A shape is a type
@@ -573,10 +573,14 @@ log = \repo ->
 -- The default `tree` shows every commit, sorted by time (parents always above
 -- their children); `treeCompact` folds uninteresting runs and far subtrees.
 tree : Repo -> Text
-tree = treeWith ({ detail = 1, margin = false, elide = false, icons = false, color = "auto", lanes = 4 })
+tree = treeWith ({ detail = 1, margin = false, elide = false, icons = false, color = "auto", lanes = 4, author = false, date = false, files = false })
 
 treeCompact : Repo -> Text
-treeCompact = treeWith ({ detail = 1, margin = false, elide = true,  icons = false, color = "auto", lanes = 4 })
+treeCompact = treeWith ({ detail = 1, margin = false, elide = true,  icons = false, color = "auto", lanes = 4, author = false, date = false, files = false })
 
 treeFull : Repo -> Text
-treeFull = treeWith ({ detail = 2, margin = true,  elide = false, icons = false, color = "auto", lanes = 4 })
+treeFull = treeWith ({ detail = 2, margin = true,  elide = false, icons = false, color = "auto", lanes = 4, author = false, date = false, files = false })
+
+-- The full tree plus the extra data columns: date, files changed, author.
+treeData : Repo -> Text
+treeData = treeWith ({ detail = 2, margin = true,  elide = false, icons = false, color = "auto", lanes = 4, author = true, date = true, files = true })

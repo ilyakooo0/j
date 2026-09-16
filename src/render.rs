@@ -623,6 +623,24 @@ pub fn render_age(time: i64) -> String {
     }
 }
 
+/// Format unix-seconds `time` as an absolute date `YYYY-MM-DD` (UTC), using
+/// the civil-from-days algorithm (no external date crate).
+pub fn render_date(time: i64) -> String {
+    let days = time.div_euclid(86_400);
+    // Howard Hinnant's civil_from_days
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    format!("{:04}-{:02}-{:02}", y, m, d)
+}
+
 /// the repo value in context (the loaded repo), for resolving ids to commits
 fn top_of(interp: &Interp, _x: &Value) -> Result<Value, Crash> {
     let old = interp.old_repo.borrow().clone();
@@ -844,6 +862,12 @@ pub struct TreeOptions {
     pub icons: bool,
     pub color: String,
     pub lanes: i64,
+    /// show the full author name column
+    pub author: bool,
+    /// show the absolute commit date column (YYYY-MM-DD)
+    pub date: bool,
+    /// show the number of files changed column
+    pub files: bool,
 }
 
 fn default_tree_options(_interp: &Interp) -> Result<TreeOptions, Crash> {
@@ -854,6 +878,9 @@ fn default_tree_options(_interp: &Interp) -> Result<TreeOptions, Crash> {
         icons: false,
         color: "auto".into(),
         lanes: 4,
+        author: false,
+        date: false,
+        files: false,
     })
 }
 
@@ -882,6 +909,18 @@ pub fn tree_with(interp: &mut Interp, opts: &Value, repo: &Value) -> Result<Valu
     if lanes < 1 {
         return Err(Crash::new("treeWith: lanes must be at least 1"));
     }
+    let author = match opts.field("author")? {
+        Value::Bool(b) => b,
+        _ => return Err(Crash::new("treeWith: author must be a Bool")),
+    };
+    let date = match opts.field("date")? {
+        Value::Bool(b) => b,
+        _ => return Err(Crash::new("treeWith: date must be a Bool")),
+    };
+    let files = match opts.field("files")? {
+        Value::Bool(b) => b,
+        _ => return Err(Crash::new("treeWith: files must be a Bool")),
+    };
     let pal = Palette {
         on: color_enabled(&color),
     };
@@ -892,6 +931,9 @@ pub fn tree_with(interp: &mut Interp, opts: &Value, repo: &Value) -> Result<Valu
         icons,
         color,
         lanes,
+        author,
+        date,
+        files,
     };
     let text = tree_render(interp, &o, repo, &pal, true)?;
     Ok(Value::text(text))
@@ -909,6 +951,7 @@ struct CommitInfo {
     is_child_of_ancestor: bool,
     meta: Option<crate::domain::MetaInfo>,
     size: Option<usize>, // lines added+removed against parent
+    nfiles: usize,       // number of files in this commit's snapshot
     detail_marks: Vec<(String, char)>,
     children: Vec<CommitInfo>,
 }
@@ -961,6 +1004,7 @@ fn build_info(
         .collect::<Result<_, _>>()?;
     let conflict = has_conflict(commit)?;
     let files = commit.field("files")?;
+    let nfiles = files.as_list()?.len();
     let (empty, size, detail_marks) = match parent_files {
         Some(pf) => {
             let change = Value::record(&[("from", pf.clone()), ("to", files.clone())]);
@@ -1029,6 +1073,7 @@ fn build_info(
         is_child_of_ancestor: parent_is_ancestor,
         meta,
         size,
+        nfiles,
         detail_marks,
         children: infos,
     })
@@ -1361,6 +1406,7 @@ fn clone_info(info: &CommitInfo, children: Vec<CommitInfo>) -> CommitInfo {
         is_child_of_ancestor: info.is_child_of_ancestor,
         meta: info.meta.clone(),
         size: info.size,
+        nfiles: info.nfiles,
         detail_marks: info.detail_marks.clone(),
         children,
     }
@@ -1503,6 +1549,9 @@ struct RowText {
     age: String,
     initials: String,
     initials_author: String,
+    // extra right-side columns, already joined in display order (§Step 4):
+    // date, files changed, full author name — only the enabled ones, plain
+    meta_extra: Vec<String>,
 }
 
 fn build_row_text(
@@ -1597,16 +1646,35 @@ fn build_row_text(
         }
         _ => (String::new(), String::new(), String::new()),
     };
+    // extra columns (§Step 4): date, files changed, full author name
+    let mut meta_extra: Vec<String> = Vec::new();
+    if let Some(info) = c {
+        if info.id != ROOT_ID {
+            if opts.date {
+                if let Some(m) = info.meta.as_ref() {
+                    meta_extra.push(render_date(m.time));
+                }
+            }
+            if opts.files {
+                meta_extra.push(format!("{} files", info.nfiles));
+            }
+            if opts.author {
+                if let Some(m) = info.meta.as_ref() {
+                    meta_extra.push(m.author.clone());
+                }
+            }
+        }
+    }
     RowText {
         gutter,
         id,
-
         bar,
         msg,
         labels,
         age,
         initials: init,
         initials_author: author,
+        meta_extra,
     }
 }
 
@@ -1701,7 +1769,10 @@ fn draw_rows(
             line.push_str(&" ".repeat(want));
             line.push_str(&pal.green(&pad_right(&t.labels, width(&t.labels))));
         }
-        if opts.margin && !t.age.is_empty() {
+        // metadata block: extra columns (date / files / author) then the margin
+        // (age + initials), right-aligned together past the message+labels edge
+        let has_margin = opts.margin && !t.age.is_empty();
+        if !t.meta_extra.is_empty() || has_margin {
             let cur = if label_col && !t.labels.is_empty() {
                 msg_end_max + 2 + width(&t.labels)
             } else {
@@ -1709,9 +1780,15 @@ fn draw_rows(
             };
             let want = 2 + lab_end_max.saturating_sub(cur);
             line.push_str(&" ".repeat(want));
-            line.push_str(&pal.grey(4, &t.age));
-            line.push_str("  ");
-            line.push_str(&pal.author(&t.initials_author, &t.initials));
+            let mut meta: Vec<String> = Vec::new();
+            for e in &t.meta_extra {
+                meta.push(pal.grey(4, e));
+            }
+            if has_margin {
+                meta.push(pal.grey(4, &t.age));
+                meta.push(pal.author(&t.initials_author, &t.initials));
+            }
+            line.push_str(&meta.join("  "));
         }
         let _ = pl;
         lines.push(line);

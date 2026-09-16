@@ -114,7 +114,7 @@ fn now() -> i64 {
 }
 
 const OPTS: &str =
-    "{ detail = 2, margin = true, elide = false, icons = false, color = \"never\", lanes = 4 }";
+    "{ detail = 2, margin = true, elide = false, icons = false, color = \"never\", lanes = 4, author = false, date = false, files = false }";
 
 #[test]
 fn tree_glyphs_basic() {
@@ -160,7 +160,7 @@ fn tree_focus_marker_and_glyph() {
     let text = tree_text(
         &mut i,
         &cfg,
-        "treeWith ({ detail = 1, margin = false, elide = false, icons = false, color = \"never\", lanes = 4 })",
+        "treeWith ({ detail = 1, margin = false, elide = false, icons = false, color = \"never\", lanes = 4, author = false, date = false, files = false })",
         repo,
     );
     assert!(text.contains("▶"), "{}", text);
@@ -207,7 +207,7 @@ fn tree_conflict_and_empty_glyphs() {
     let text = tree_text(
         &mut i,
         &cfg,
-        "treeWith ({ detail = 1, margin = false, elide = false, icons = false, color = \"never\", lanes = 4 })",
+        "treeWith ({ detail = 1, margin = false, elide = false, icons = false, color = \"never\", lanes = 4, author = false, date = false, files = false })",
         repo,
     );
     assert!(text.contains("⊗"), "{}", text);
@@ -228,7 +228,7 @@ fn tree_icons_set() {
     let text = tree_text(
         &mut i,
         &cfg,
-        "treeWith ({ detail = 1, margin = false, elide = false, icons = true, color = \"never\", lanes = 4 })",
+        "treeWith ({ detail = 1, margin = false, elide = false, icons = true, color = \"never\", lanes = 4, author = false, date = false, files = false })",
         repo,
     );
     assert!(text.contains("🌱"), "{}", text);
@@ -248,7 +248,7 @@ fn tree_labels_column_only_when_present() {
     let text = tree_text(
         &mut i,
         &cfg,
-        "treeWith ({ detail = 1, margin = false, elide = false, icons = false, color = \"never\", lanes = 4 })",
+        "treeWith ({ detail = 1, margin = false, elide = false, icons = false, color = \"never\", lanes = 4, author = false, date = false, files = false })",
         repo,
     );
     assert!(text.contains("feat"), "{}", text);
@@ -292,7 +292,7 @@ fn tree_color_never_has_no_ansi() {
     let text = tree_text(
         &mut i,
         &cfg,
-        "treeWith ({ detail = 1, margin = false, elide = false, icons = false, color = \"never\", lanes = 4 })",
+        "treeWith ({ detail = 1, margin = false, elide = false, icons = false, color = \"never\", lanes = 4, author = false, date = false, files = false })",
         repo,
     );
     assert!(!text.contains('\x1b'), "ANSI found in color=never output");
@@ -311,7 +311,7 @@ fn tree_color_always_has_ansi() {
     let text = tree_text(
         &mut i,
         &cfg,
-        "treeWith ({ detail = 1, margin = false, elide = false, icons = false, color = \"always\", lanes = 4 })",
+        "treeWith ({ detail = 1, margin = false, elide = false, icons = false, color = \"always\", lanes = 4, author = false, date = false, files = false })",
         repo,
     );
     assert!(text.contains('\x1b'), "no ANSI in color=always output");
@@ -327,7 +327,7 @@ fn tree_minted_commits_have_blank_margin() {
     let text = tree_text(
         &mut i,
         &cfg,
-        "treeWith ({ detail = 2, margin = true, elide = false, icons = false, color = \"never\", lanes = 4 })",
+        "treeWith ({ detail = 2, margin = true, elide = false, icons = false, color = \"never\", lanes = 4, author = false, date = false, files = false })",
         repo,
     );
     assert!(text.contains("minted"), "{}", text);
@@ -350,7 +350,7 @@ fn detail_line_changed_paths() {
     let text = tree_text(
         &mut i,
         &cfg,
-        "treeWith ({ detail = 2, margin = false, elide = false, icons = false, color = \"never\", lanes = 4 })",
+        "treeWith ({ detail = 2, margin = false, elide = false, icons = false, color = \"never\", lanes = 4, author = false, date = false, files = false })",
         repo,
     );
     assert!(text.contains("+ new"), "{}", text);
@@ -616,7 +616,7 @@ fn tree_worked_example() {
     let text = tree_text(
         &mut i,
         &cfg,
-        "treeWith ({ detail = 2, margin = true, elide = true, icons = false, color = \"never\", lanes = 3 })",
+        "treeWith ({ detail = 2, margin = true, elide = true, icons = false, color = \"never\", lanes = 3, author = false, date = false, files = false })",
         repo,
     );
     let expected = "\
