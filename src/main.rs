@@ -38,19 +38,25 @@ fn config_path() -> String {
     format!("{}/.config/j/config.j", home)
 }
 
+/// The default config, embedded so `j` always has it regardless of how it was
+/// installed (the share/j/config.j file may not exist next to the binary).
+const DEFAULT_CONFIG: &str = include_str!("../config.j");
+
 fn load_config_file() -> Result<(Config, String), ExitCode> {
     let path = config_path();
     let src = match std::fs::read_to_string(&path) {
         Ok(s) => s,
         Err(_) => {
-            return Err(err(
-                3,
-                format!(
-                    "no config at {}; the reference config.j is installed at {}",
-                    path,
-                    reference_config_path()
-                ),
-            ));
+            // No user config yet: materialise the default there, editable by
+            // the current user, so they have a starting point to customise.
+            if let Err(e) = write_default_config(&path) {
+                return Err(err(3, format!("cannot create config at {}: {}", path, e)));
+            }
+            eprintln!("j: created an editable default config at {}", path);
+            match std::fs::read_to_string(&path) {
+                Ok(s) => s,
+                Err(e) => return Err(err(3, format!("cannot read config at {}: {}", path, e))),
+            }
         }
     };
     match config::load_config(&src) {
@@ -59,17 +65,20 @@ fn load_config_file() -> Result<(Config, String), ExitCode> {
     }
 }
 
-fn reference_config_path() -> String {
-    // installed next to the binary under <prefix>/share/j/config.j
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(p) = exe.parent().and_then(|p| p.parent()) {
-            let cand = p.join("share/j/config.j");
-            if cand.exists() {
-                return cand.display().to_string();
-            }
-        }
+/// Write the embedded default config to `path`, creating parent directories
+/// and making the file readable and writable by the current user.
+fn write_default_config(path: &str) -> std::io::Result<()> {
+    if let Some(parent) = std::path::Path::new(path).parent() {
+        std::fs::create_dir_all(parent)?;
     }
-    "/usr/local/share/j/config.j".into()
+    std::fs::write(path, DEFAULT_CONFIG)?;
+    // user-read+write (0o600 on unix): the file is meant to be edited by them
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    }
+    Ok(())
 }
 
 const RESERVED: &[&str] = &["init", "clone", "remote", "fetch", "push", "undo", "redo", "ops"];

@@ -450,7 +450,7 @@ fn init_refuses_inside_existing_repo() {
 }
 
 #[test]
-fn missing_config_is_exit_3() {
+fn missing_config_is_created_editable() {
     let dir = std::env::temp_dir().join(format!(
         "j-cli-nocfg-{}-{}",
         std::process::id(),
@@ -461,14 +461,25 @@ fn missing_config_is_exit_3() {
     ));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
+    let cfg_home = dir.join("nonexistent");
     let out = Command::new(j_bin())
         .arg("status")
         .current_dir(&dir)
-        .env("XDG_CONFIG_HOME", dir.join("nonexistent"))
+        .env("XDG_CONFIG_HOME", &cfg_home)
         .output()
         .unwrap();
-    assert_eq!(out.status.code(), Some(3));
+    // no config error: the default config is materialised instead
     let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(stderr.contains("no config"), "{}", stderr);
+    assert!(!stderr.contains("no config"), "{}", stderr);
+    assert!(stderr.contains("created an editable default config"), "{}", stderr);
+    // the config now exists at the user path and is editable by the owner
+    let cfg = cfg_home.join("j/config.j");
+    let written = std::fs::read_to_string(&cfg).expect("config was created");
+    assert!(written.contains("treeWith"), "default config content");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(std::fs::metadata(&cfg).unwrap().permissions().mode() & 0o777, 0o600);
+    }
     let _ = std::fs::remove_dir_all(&dir);
 }
