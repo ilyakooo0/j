@@ -69,6 +69,23 @@ impl Palette {
         let code = ["31", "32", "33", "34", "35", "36"][hue as usize];
         self.wrap(code, s)
     }
+    /// colour with a raw ANSI code (used for meaning-coloured glyphs)
+    pub fn code(&self, code: &str, s: &str) -> String {
+        self.wrap(code, s)
+    }
+    /// Apply a background band across a whole line. The line already contains
+    /// colour codes whose `\x1b[0m` resets would clear the background mid-line,
+    /// so the background is re-applied after every reset. No-op when colour is
+    /// off, so the focus stays marked only by the `▶` gutter (§Colour).
+    pub fn bg_line(&self, bg: &str, s: &str) -> String {
+        if !self.on {
+            return s.to_string();
+        }
+        let onset = format!("\x1b[{}m", bg);
+        let reapply = format!("\x1b[0m{}", onset);
+        let body = s.replace("\x1b[0m", &reapply);
+        format!("{}{}\x1b[0m", onset, body)
+    }
 }
 
 pub fn color_enabled(mode: &str) -> bool {
@@ -421,7 +438,8 @@ fn node_glyph(
 }
 
 fn has_conflict(c: &Value) -> Result<bool, Crash> {
-    for e in c.field("files").and_then(|v| v.as_list().map(|x| x.to_vec()))?.iter() {
+    let files = c.field("files")?;
+    for e in files.as_list()?.iter() {
         if let Value::Blob(b) = e.field("content")? {
             if b.is_unresolved() {
                 return Ok(true);
@@ -451,7 +469,7 @@ fn display_block(
             return Ok(());
         }
         Value::Blob(b) => {
-            let content = String::from_utf8_lossy(&b.bytes()).to_string();
+            let content = String::from_utf8_lossy(&b.bytes()?).to_string();
             out.push_str(&indent_multiline(&content, indent));
             return Ok(());
         }
@@ -885,42 +903,38 @@ fn default_tree_options(_interp: &Interp) -> Result<TreeOptions, Crash> {
 }
 
 pub fn tree_with(interp: &mut Interp, opts: &Value, repo: &Value) -> Result<Value, Crash> {
-    let detail = match opts.field("detail")? {
-        Value::Int(n) => n.to_string().parse::<i64>().unwrap_or(1),
-        _ => return Err(Crash::new("treeWith: detail must be an Int")),
+    let defaults = default_tree_options(interp)?;
+    // a missing option falls back to its default, so an older config that
+    // predates a newer option keeps working; a present option is type-checked
+    let bool_opt = |name: &str, default: bool| -> Result<bool, Crash> {
+        match opts.field(name) {
+            Ok(Value::Bool(b)) => Ok(b),
+            Ok(_) => Err(Crash::new(format!("treeWith: {} must be a Bool", name))),
+            Err(_) => Ok(default),
+        }
     };
-    let margin = match opts.field("margin")? {
-        Value::Bool(b) => b,
-        _ => return Err(Crash::new("treeWith: margin must be a Bool")),
+    let int_opt = |name: &str, default: i64| -> Result<i64, Crash> {
+        match opts.field(name) {
+            Ok(Value::Int(n)) => Ok(n.to_string().parse::<i64>().unwrap_or(default)),
+            Ok(_) => Err(Crash::new(format!("treeWith: {} must be an Int", name))),
+            Err(_) => Ok(default),
+        }
     };
-    let elide = match opts.field("elide")? {
-        Value::Bool(b) => b,
-        _ => return Err(Crash::new("treeWith: elide must be a Bool")),
+    let detail = int_opt("detail", defaults.detail)?;
+    let margin = bool_opt("margin", defaults.margin)?;
+    let elide = bool_opt("elide", defaults.elide)?;
+    let icons = bool_opt("icons", defaults.icons)?;
+    let color = match opts.field("color") {
+        Ok(v) => v.as_text()?.to_string(),
+        Err(_) => defaults.color.clone(),
     };
-    let icons = match opts.field("icons")? {
-        Value::Bool(b) => b,
-        _ => return Err(Crash::new("treeWith: icons must be a Bool")),
-    };
-    let color = opts.field("color")?.as_text()?.to_string();
-    let lanes = match opts.field("lanes")? {
-        Value::Int(n) => n.to_string().parse::<i64>().unwrap_or(0),
-        _ => return Err(Crash::new("treeWith: lanes must be an Int")),
-    };
+    let lanes = int_opt("lanes", defaults.lanes)?;
     if lanes < 1 {
         return Err(Crash::new("treeWith: lanes must be at least 1"));
     }
-    let author = match opts.field("author")? {
-        Value::Bool(b) => b,
-        _ => return Err(Crash::new("treeWith: author must be a Bool")),
-    };
-    let date = match opts.field("date")? {
-        Value::Bool(b) => b,
-        _ => return Err(Crash::new("treeWith: date must be a Bool")),
-    };
-    let files = match opts.field("files")? {
-        Value::Bool(b) => b,
-        _ => return Err(Crash::new("treeWith: files must be a Bool")),
-    };
+    let author = bool_opt("author", defaults.author)?;
+    let date = bool_opt("date", defaults.date)?;
+    let files = bool_opt("files", defaults.files)?;
     let pal = Palette {
         on: color_enabled(&color),
     };
@@ -981,7 +995,6 @@ impl CommitInfo {
 fn build_info(
     interp: &mut Interp,
     opts: &TreeOptions,
-    loc: &Value,
     commit: &Value,
     children: &[Value],
     immutable: &BTreeSet<String>,
@@ -990,6 +1003,7 @@ fn build_info(
     parent_files: Option<&Value>,
     with_focus: bool,
     parent_is_ancestor: bool,
+    parent_is_focus: bool,
 ) -> Result<CommitInfo, Crash> {
     let id = match commit.field("id")? {
         Value::Id(i) => i.to_string(),
@@ -1005,31 +1019,50 @@ fn build_info(
     let conflict = has_conflict(commit)?;
     let files = commit.field("files")?;
     let nfiles = files.as_list()?.len();
+    // `empty` (no change against the parent) is needed at every detail level;
+    // compute it by id-based snapshot equality, which never forces blob bytes.
+    // `size` (a line count) and `detail_marks` are only rendered for detail ≥
+    // 2 and for the focus and its neighbours, so skip the per-commit line
+    // counting elsewhere — it dominates render time on large histories.
+    let is_focus_pre = with_focus && id == focus_id;
+    let child_is_focus = with_focus
+        && children.iter().any(|c| {
+            matches!(c.field("root").and_then(|r| r.field("id")), Ok(Value::Id(i)) if *i == focus_id)
+        });
+    let want_diff = opts.detail >= 2 || is_focus_pre || child_is_focus || parent_is_focus;
     let (empty, size, detail_marks) = match parent_files {
         Some(pf) => {
-            let change = Value::record(&[("from", pf.clone()), ("to", files.clone())]);
-            let marks = touched_paths(&change)?;
-            let empty = marks.is_empty();
-            // size: lines added+removed against the parent
-            let from_map = snapshot_map_of(pf)?;
-            let to_map = snapshot_map_of(&files)?;
-            let mut lines = 0usize;
-            for (p, _, _) in &marks {
-                let key: Vec<String> = p.split('/').map(|s| s.to_string()).collect();
-                let count = |m: &BTreeMap<Vec<String>, Value>| -> usize {
-                    match m.get(&key) {
-                        Some(Value::Blob(b)) => {
-                            let n = String::from_utf8_lossy(&b.bytes()).lines().count();
-                            n.max(1)
+            // empty ⟺ the snapshot equals the parent's (id-based, no forcing)
+            let empty = crate::value::value_eq(&files, pf)?;
+            if want_diff {
+                let change = Value::record(&[("from", pf.clone()), ("to", files.clone())]);
+                let marks = touched_paths(&change)?;
+                // size: lines added+removed against the parent
+                let from_map = snapshot_map_of(pf)?;
+                let to_map = snapshot_map_of(&files)?;
+                let mut lines = 0usize;
+                for (p, _, _) in &marks {
+                    let key: Vec<String> = p.split('/').map(|s| s.to_string()).collect();
+                    let count = |m: &BTreeMap<Vec<String>, Value>| -> usize {
+                        match m.get(&key) {
+                            Some(Value::Blob(b)) => {
+                                let n = b
+                                    .bytes()
+                                    .map(|v| String::from_utf8_lossy(&v).lines().count())
+                                    .unwrap_or(1);
+                                n.max(1)
+                            }
+                            _ => 1,
                         }
-                        _ => 1,
-                    }
-                };
-                lines += count(&from_map) + count(&to_map);
+                    };
+                    lines += count(&from_map) + count(&to_map);
+                }
+                let marks2: Vec<(String, char)> =
+                    marks.iter().map(|(p, m, _)| (p.clone(), *m)).collect();
+                (marks.is_empty(), Some(lines), marks2)
+            } else {
+                (empty, None, Vec::new())
             }
-            let marks2: Vec<(String, char)> =
-                marks.iter().map(|(p, m, _)| (p.clone(), *m)).collect();
-            (empty, Some(lines), marks2)
         }
         None => {
             let n = files.as_list()?.len();
@@ -1041,15 +1074,9 @@ fn build_info(
     let is_ancestor_of_focus = anc.contains(&id);
     let mut infos = Vec::new();
     for c in children.iter() {
-        let child_loc = crate::repo::by_id(loc, &match c.field("root")?.field("id")? {
-            Value::Id(i) => i.to_string(),
-            _ => continue,
-        })?
-        .unwrap();
         infos.push(build_info(
             interp,
             opts,
-            &child_loc,
             &c.field("root")?,
             c.field("children")?.as_list()?,
             immutable,
@@ -1058,6 +1085,7 @@ fn build_info(
             Some(&files),
             with_focus,
             is_ancestor_of_focus,
+            is_focus_pre,
         )?);
     }
     let immutable_flag = immutable.contains(&id);
@@ -1092,20 +1120,19 @@ fn tree_render(
         Value::Id(i) => i.to_string(),
         _ => String::new(),
     };
-    // ancestors of focus
+    // ancestors of focus: the focus id plus every parent recorded in the
+    // zipper's context frames — read directly rather than refocusing each
+    // frame (an O(n) by_id per level would make this O(n²))
     let mut anc: BTreeSet<String> = BTreeSet::new();
-    let mut cur = repo.clone();
-    loop {
-        let id = match cur.field("root")?.field("id")? {
-            Value::Id(i) => i.to_string(),
-            _ => break,
-        };
-        anc.insert(id);
-        let ctx = cur.field("context").and_then(|v| v.as_list().map(|x| x.to_vec()))?;
-        if ctx.is_empty() {
-            break;
+    if let Ok(Value::Id(i)) = repo.field("root").and_then(|r| r.field("id")) {
+        anc.insert(i.to_string());
+    }
+    if let Ok(ctx) = repo.field("context").and_then(|v| v.as_list().map(|x| x.to_vec())) {
+        for frame in &ctx {
+            if let Ok(pid) = id_of_frame_parent(frame) {
+                anc.insert(pid);
+            }
         }
-        cur = crate::repo::by_id(&cur, &id_of_frame_parent(&ctx[0])?)?.unwrap();
     }
     // the whole history, from the top
     let top = crate::repo::by_id(repo, &top_id(repo)?)?.unwrap_or_else(|| repo.clone());
@@ -1114,7 +1141,6 @@ fn tree_render(
     let root_info = build_info(
         interp,
         opts,
-        &top,
         &root_commit,
         top_children.as_list()?,
         &immutable,
@@ -1122,6 +1148,7 @@ fn tree_render(
         &anc,
         None,
         with_focus,
+        false,
         false,
     )?;
     // trunk T (§Trunk)
@@ -1182,17 +1209,16 @@ fn id_of_frame_parent(frame: &Value) -> Result<String, Crash> {
 }
 
 fn top_id(repo: &Value) -> Result<String, Crash> {
-    let mut cur = repo.clone();
-    loop {
-        let ctx = cur.field("context").and_then(|v| v.as_list().map(|x| x.to_vec()))?;
-        if ctx.is_empty() {
-            return match cur.field("root")?.field("id")? {
-                Value::Id(i) => Ok(i.to_string()),
-                v => Err(Crash::new(format!("expected an Id, got a {}", v.kind_name()))),
-            };
-        }
-        let pid = id_of_frame_parent(&ctx[0])?;
-        cur = crate::repo::by_id(&cur, &pid)?.unwrap();
+    // the topmost ancestor's id: the focus's own id when the context is empty,
+    // otherwise the parent recorded in the *last* (outermost) zipper frame —
+    // read directly, since refocusing each frame with by_id is O(n²) overall
+    let ctx = repo.field("context").and_then(|v| v.as_list().map(|x| x.to_vec()))?;
+    match ctx.last() {
+        None => match repo.field("root")?.field("id")? {
+            Value::Id(i) => Ok(i.to_string()),
+            v => Err(Crash::new(format!("expected an Id, got a {}", v.kind_name()))),
+        },
+        Some(frame) => id_of_frame_parent(frame),
     }
 }
 
@@ -1624,10 +1650,13 @@ fn build_row_text(
     } else {
         String::new()
     };
-    // message
+    // message, coloured by state (§Colour): focus bold, conflict red, empty
+    // dim-italic; the collapsed marker is dim
     let msg_first = c.map(|x| x.message.lines().next().unwrap_or("")).unwrap_or("");
     let mut msg = match c {
         Some(info) if info.empty => pal.dim_italic(msg_first),
+        Some(info) if info.is_focus => pal.bold(msg_first),
+        Some(info) if info.conflict => pal.red(msg_first),
         _ => msg_first.to_string(),
     };
     if let Display::Collapsed { hidden, .. } = n {
@@ -1635,7 +1664,7 @@ fn build_row_text(
             if !msg.is_empty() {
                 msg.push_str("  ");
             }
-            msg.push_str(&format!("⋯ {}", hidden));
+            msg.push_str(&pal.dim(&format!("⋯ {}", hidden)));
         }
     }
     let labels = c.map(|x| x.labels.join("  ")).unwrap_or_default();
@@ -1755,7 +1784,12 @@ fn draw_rows(
         let (chars, lane0) = rail_row(rows, placements, idx, lanes_n, opts);
         let mut line = String::new();
         line.push_str(&t.gutter);
-        line.push_str(&color_rails(&chars, &lane0, pal));
+        // the node glyph (on a commit row) is meaning-coloured; rails lane-coloured
+        let glyph = match (n, pl.lane) {
+            (Display::Commit { info, .. }, Some(l)) => Some((2 * l, glyph_ansi(info))),
+            _ => None,
+        };
+        line.push_str(&color_rails(&chars, &lane0, pal, glyph));
         line.push(' ');
         line.push_str(&t.id);
         if !t.bar.is_empty() {
@@ -1791,7 +1825,26 @@ fn draw_rows(
             line.push_str(&meta.join("  "));
         }
         let _ = pl;
-        lines.push(line);
+        // the whole focus row is highlighted with a background band across the
+        // full terminal width (§Colour; colour only — the ▶ gutter still marks
+        // the focus when colour is off)
+        let is_focus_row = n.commit().map(|c| c.is_focus).unwrap_or(false);
+        if is_focus_row && pal.on {
+            let target_w = if crate::show::stdout_is_tty() {
+                crate::show::terminal_width()
+            } else {
+                None
+            };
+            let padded = match target_w {
+                Some(w) if width(&line) < w => {
+                    format!("{}{}", line, " ".repeat(w - width(&line)))
+                }
+                _ => line.clone(),
+            };
+            lines.push(pal.bg_line("48;5;236", &padded));
+        } else {
+            lines.push(line);
+        }
         // detail line (detail = 2, focus only)
         if opts.detail >= 2
             && with_focus
@@ -1801,7 +1854,7 @@ fn draw_rows(
             let (dchars, dlane0) = detail_rail_row(rows, placements, idx, lanes_n);
             let mut dline = String::new();
             dline.push_str("  ");
-            dline.push_str(&color_rails(&dchars, &dlane0, pal));
+            dline.push_str(&color_rails(&dchars, &dlane0, pal, None));
             dline.push(' ');
             dline.push_str(&" ".repeat(id_w + 2));
             let marks: Vec<String> = c
@@ -2120,12 +2173,28 @@ fn detail_rail_row(
     (chars, lane0)
 }
 
-fn color_rails(chars: &[char], lane0: &[bool], pal: &Palette) -> String {
+/// Colour the rails. Rail connectors are lane-coloured (lane 0 = immutable
+/// blue, others dim); the node glyph at `glyph` (its lane position and ANSI
+/// code) is meaning-coloured.
+fn color_rails(
+    chars: &[char],
+    lane0: &[bool],
+    pal: &Palette,
+    glyph: Option<(usize, &str)>,
+) -> String {
     let mut s = String::new();
     for (i, c) in chars.iter().enumerate() {
         let t = c.to_string();
         if *c == ' ' {
             s.push(*c);
+        } else if let Some((pos, code)) = glyph {
+            if i == pos {
+                s.push_str(&pal.code(code, &t));
+            } else if lane0[i] {
+                s.push_str(&pal.blue(&t));
+            } else {
+                s.push_str(&pal.dim(&t));
+            }
         } else if lane0[i] {
             s.push_str(&pal.blue(&t));
         } else {
@@ -2279,6 +2348,26 @@ fn glyph_for(info: &CommitInfo, icons: bool) -> &'static str {
         "🌿"
     } else {
         "🍃"
+    }
+}
+
+/// The ANSI colour code for a node glyph, by meaning (§Colour: glyphs carry
+/// meaning; colour only adds emphasis). Mirrors the precedence of `glyph_for`.
+fn glyph_ansi(info: &CommitInfo) -> &'static str {
+    if info.id == ROOT_ID {
+        "1" // root: bold
+    } else if info.conflict {
+        "31" // conflict: red
+    } else if info.empty {
+        "2" // empty: dim
+    } else if info.immutable {
+        "34" // immutable: blue
+    } else if info.is_focus {
+        "1;36" // focus: bold cyan
+    } else if info.is_ancestor_of_focus {
+        "32" // ancestor of focus: green
+    } else {
+        "37" // other commit: light grey
     }
 }
 

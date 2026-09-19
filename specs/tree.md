@@ -232,9 +232,18 @@ drawn with `⌂`.
 
 #### Colour
 
-Unchanged for text. Rails in lane 0 take the immutable colour; rails in other
-lanes are dim. Glyphs and rails carry the meaning; colour only adds emphasis,
-so a colourless rendering loses nothing.
+Glyphs are coloured by meaning (the same precedence as their shape): root bold,
+conflict red, empty dim, immutable blue, focus bold cyan, ancestor of focus
+green, other light grey. Ids keep their existing colours (conflict red,
+immutable blue). Messages are bold on the focus row, red on a conflict, and
+dim-italic when empty. Labels are green; the margin and the data columns are
+grey with author-hued initials. Rail connectors in lane 0 take the immutable
+colour; connectors in other lanes are dim.
+
+The whole focus row is highlighted with a background band that spans the full
+terminal width. This is colour only: glyphs, rails, and the `▶` gutter still
+carry the meaning, so a colourless rendering loses nothing — the band is a
+no-op when colour is off.
 
 #### Legend
 

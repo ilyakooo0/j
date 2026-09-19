@@ -42,9 +42,13 @@ fn render(interp: &Interp, v: &Value) -> String {
                 Ok(s) => format!("blob {}", text_literal(&s)),
                 Err(_) => "blob \"<binary>\"".into(),
             },
-            BlobContent::Conflict(_) => {
-                let s = String::from_utf8_lossy(&b.bytes()).to_string();
-                format!("{{- unresolved -}} blob {}", text_literal(&s))
+            BlobContent::Lazy(_) | BlobContent::Conflict(_) => {
+                let s = b
+                    .bytes()
+                    .map(|v| String::from_utf8_lossy(&v).to_string())
+                    .unwrap_or_else(|_| "<unreadable>".into());
+                let marker = if b.is_unresolved() { "{- unresolved -} " } else { "" };
+                format!("{}blob {}", marker, text_literal(&s))
             }
         },
         Value::Shape(s) => s.name.clone(),
@@ -275,11 +279,11 @@ pub fn difft(path: &Value, a: &Value, b: &Value) -> Result<Value, Crash> {
         .transpose()?
         .unwrap_or_else(|| "file".to_string());
     let a_bytes = match a {
-        Value::Blob(bl) => bl.bytes(),
+        Value::Blob(bl) => bl.bytes()?,
         v => return Err(Crash::new(format!("difft: expected a Blob, got a {}", v.kind_name()))),
     };
     let b_bytes = match b {
-        Value::Blob(bl) => bl.bytes(),
+        Value::Blob(bl) => bl.bytes()?,
         v => return Err(Crash::new(format!("difft: expected a Blob, got a {}", v.kind_name()))),
     };
     let dir = tempfile::tempdir()

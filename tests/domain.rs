@@ -59,7 +59,7 @@ fn unresolved_at(snap: &[Value], path: &str) -> bool {
 
 fn blob_text(v: &Value) -> String {
     match v {
-        Value::Blob(b) => String::from_utf8(b.bytes()).unwrap(),
+        Value::Blob(b) => String::from_utf8(b.bytes().unwrap()).unwrap(),
         _ => panic!("not a blob"),
     }
 }

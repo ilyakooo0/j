@@ -73,8 +73,16 @@ fn refocus_child(repo: &Value, child: &Value) -> Result<Value, Crash> {
     let mut left = Vec::new();
     let mut right = Vec::new();
     let mut found = false;
+    // match by the child's root id: ids are unique per repo (§7.5 validates
+    // this at persist time), and a deep value_eq here would compare the whole
+    // subtree — files included — making by_id quadratic in history size
+    let want_id = id_of(&child.field("root")?).ok();
     for c in children.iter() {
-        if !found && value_eq(c, child)? {
+        let same = match (&want_id, id_of(&c.field("root")?).ok()) {
+            (Some(w), Some(cid)) => *w == cid,
+            _ => value_eq(c, child)?,
+        };
+        if !found && same {
             found = true;
         } else if !found {
             left.push(c.clone());

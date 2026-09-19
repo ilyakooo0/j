@@ -113,18 +113,21 @@ pub fn map_to_snapshot(m: BTreeMap<Vec<String>, Value>) -> Vec<Value> {
         .collect()
 }
 
-fn blob_eq(a: &Value, b: &Value) -> bool {
-    match (a, b) {
+fn blob_eq(a: &Value, b: &Value) -> Result<bool, Crash> {
+    Ok(match (a, b) {
         (Value::Blob(x), Value::Blob(y)) => {
             x.kind == y.kind
                 && match (&x.content, &y.content) {
                     (BlobContent::Resolved(p), BlobContent::Resolved(q)) => p == q,
+                    (BlobContent::Lazy(p), BlobContent::Lazy(q)) => p.id == q.id,
+                    (BlobContent::Lazy(p), BlobContent::Resolved(q))
+                    | (BlobContent::Resolved(q), BlobContent::Lazy(p)) => p.force()? == *q,
                     (BlobContent::Conflict(p), BlobContent::Conflict(q)) => p == q,
                     _ => false,
                 }
         }
         _ => false,
-    }
+    })
 }
 
 fn empty_blob() -> Value {
@@ -165,8 +168,8 @@ pub fn simple_replay(
         let o_present = onto.contains_key(&p);
         let f_present = from.contains_key(&p);
         let t_present = to.contains_key(&p);
-        let changed_to = !(f_present == t_present && (!f_present || blob_eq(&f, &t)));
-        let changed_onto = !(f_present == o_present && (!f_present || blob_eq(&f, &o)));
+        let changed_to = !(f_present == t_present && (!f_present || blob_eq(&f, &t)?));
+        let changed_onto = !(f_present == o_present && (!f_present || blob_eq(&f, &o)?));
         match (changed_to, changed_onto) {
             (false, false) => {
                 if o_present {
@@ -184,27 +187,27 @@ pub fn simple_replay(
                 }
             }
             (true, true) => {
-                if t_present && o_present && blob_eq(&t, &o) {
+                if t_present && o_present && blob_eq(&t, &o)? {
                     out.insert(p, t);
                 } else if !t_present && !o_present {
                     // both deleted
                 } else {
                     // conflict: sides [to, from, onto] (add, remove, add)
-                    let get_bytes = |v: &Value, present: bool| -> Rc<Vec<u8>> {
+                    let get_bytes = |v: &Value, present: bool| -> Result<Rc<Vec<u8>>, Crash> {
                         if !present {
-                            return Rc::new(Vec::new());
+                            return Ok(Rc::new(Vec::new()));
                         }
                         match v {
-                            Value::Blob(b) => Rc::new(b.bytes()),
-                            _ => Rc::new(Vec::new()),
+                            Value::Blob(b) => Ok(Rc::new(b.bytes()?)),
+                            _ => Ok(Rc::new(Vec::new())),
                         }
                     };
                     out.insert(
                         p,
                         conflict_blob(vec![
-                            get_bytes(&t, t_present),
-                            get_bytes(&f, f_present),
-                            get_bytes(&o, o_present),
+                            get_bytes(&t, t_present)?,
+                            get_bytes(&f, f_present)?,
+                            get_bytes(&o, o_present)?,
                         ]),
                     );
                 }

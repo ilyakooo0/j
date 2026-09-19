@@ -523,7 +523,7 @@ fn b_blob(_i: &mut Interp, args: &[Value]) -> BResult {
 fn b_text(_i: &mut Interp, args: &[Value]) -> BResult {
     match &args[0] {
         Value::Blob(b) => {
-            let bytes = b.bytes();
+            let bytes = b.bytes()?;
             let s = String::from_utf8(bytes)
                 .map_err(|_| Crash::new("text: blob content is not UTF-8"))?;
             Ok(Value::text(s))
@@ -588,7 +588,7 @@ fn b_diff(_i: &mut Interp, args: &[Value]) -> BResult {
 
 fn blob_text_utf8(v: &Value) -> Result<String, Crash> {
     match v {
-        Value::Blob(b) => String::from_utf8(b.bytes())
+        Value::Blob(b) => String::from_utf8(b.bytes()?)
             .map_err(|_| Crash::new("diff: blob content is not UTF-8")),
         v => Err(Crash::new(format!(
             "diff: expected a Blob, got a {}",

@@ -261,7 +261,7 @@ fn conflict_blob_markers() {
         ]),
     }));
     let Value::Blob(b) = &v else { panic!() };
-    let text = String::from_utf8(b.bytes()).unwrap();
+    let text = String::from_utf8(b.bytes().unwrap()).unwrap();
     assert!(text.contains("<<<<<<<"), "{}", text);
     assert!(text.contains(">>>>>>>"), "{}", text);
     assert!(text.contains("+++++++"), "{}", text);

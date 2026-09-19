@@ -27,13 +27,77 @@ pub enum BlobKind {
     Symlink,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub enum BlobContent {
     Resolved(Rc<Vec<u8>>),
+    /// not yet read from the store; `force` reads the bytes on first use and
+    /// memoizes them. `id` is the content hash (jj FileId hex), which is
+    /// enough for equality and for persisting an unchanged blob without ever
+    /// reading its bytes.
+    Lazy(Rc<LazyBlob>),
     /// Conflict sides, jj order: alternating adds and removes, starting and
     /// ending with an add: [add, (remove, add)*]. For the in-memory backend:
     /// [to, from, onto]-style three sides as [add, remove, add].
     Conflict(Vec<Rc<Vec<u8>>>),
+}
+
+/// A blob whose bytes are read from the store only on first use (§7.2):
+/// building the Repo value must not inflate every file of every commit.
+pub struct LazyBlob {
+    /// content hash (jj FileId hex)
+    pub id: String,
+    state: std::cell::RefCell<LazyState>,
+}
+
+enum LazyState {
+    Pending(Box<dyn FnOnce() -> Result<Rc<Vec<u8>>, Crash>>),
+    Ready(Rc<Vec<u8>>),
+}
+
+impl std::fmt::Debug for LazyBlob {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Lazy({})", self.id)
+    }
+}
+
+impl std::fmt::Debug for BlobContent {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            BlobContent::Resolved(b) => write!(f, "Resolved({} bytes)", b.len()),
+            BlobContent::Lazy(l) => write!(f, "{:?}", l),
+            BlobContent::Conflict(s) => write!(f, "Conflict({} sides)", s.len()),
+        }
+    }
+}
+
+impl LazyBlob {
+    pub fn new(id: String, force: impl FnOnce() -> Result<Rc<Vec<u8>>, Crash> + 'static) -> Self {
+        LazyBlob {
+            id,
+            state: std::cell::RefCell::new(LazyState::Pending(Box::new(force))),
+        }
+    }
+
+    /// the bytes, reading from the store on first call and memoizing
+    pub fn force(&self) -> Result<Rc<Vec<u8>>, Crash> {
+        // fast path: already forced
+        if let LazyState::Ready(b) = &*self.state.borrow() {
+            return Ok(b.clone());
+        }
+        let thunk = {
+            let mut st = self.state.borrow_mut();
+            match std::mem::replace(&mut *st, LazyState::Ready(Rc::new(Vec::new()))) {
+                LazyState::Pending(t) => t,
+                LazyState::Ready(b) => {
+                    *st = LazyState::Ready(b.clone());
+                    return Ok(b);
+                }
+            }
+        };
+        let bytes = thunk()?;
+        *self.state.borrow_mut() = LazyState::Ready(bytes.clone());
+        Ok(bytes)
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -52,17 +116,30 @@ impl BlobVal {
     pub fn is_unresolved(&self) -> bool {
         matches!(self.content, BlobContent::Conflict(_))
     }
+    /// size in bytes; a lazy blob reports the size of its (memoized) bytes,
+    /// forcing on first call
     pub fn size(&self) -> usize {
         match &self.content {
             BlobContent::Resolved(b) => b.len(),
+            BlobContent::Lazy(l) => l.force().map(|b| b.len()).unwrap_or(0),
             BlobContent::Conflict(sides) => sides.iter().map(|s| s.len()).sum(),
         }
     }
-    /// content as bytes; conflicts render with jj-style conflict markers
-    pub fn bytes(&self) -> Vec<u8> {
+    /// content as bytes, forcing a lazy blob; conflicts render with jj-style
+    /// conflict markers
+    pub fn bytes(&self) -> Result<Vec<u8>, Crash> {
         match &self.content {
-            BlobContent::Resolved(b) => b.as_ref().clone(),
-            BlobContent::Conflict(sides) => render_conflict(sides),
+            BlobContent::Resolved(b) => Ok(b.as_ref().clone()),
+            BlobContent::Lazy(l) => Ok(l.force()?.as_ref().clone()),
+            BlobContent::Conflict(sides) => Ok(render_conflict(sides)),
+        }
+    }
+    /// the content hash of a lazy blob, if it is one (used to persist an
+    /// unchanged blob without reading its bytes)
+    pub fn lazy_id(&self) -> Option<&str> {
+        match &self.content {
+            BlobContent::Lazy(l) => Some(&l.id),
+            _ => None,
         }
     }
 }
@@ -483,7 +560,9 @@ pub fn value_eq(a: &Value, b: &Value) -> Result<bool, Crash> {
             }
             true
         }
-        (Value::Blob(x), Value::Blob(y)) => x.kind == y.kind && blob_content_eq(&x.content, &y.content),
+        (Value::Blob(x), Value::Blob(y)) => {
+            x.kind == y.kind && blob_content_eq(&x.content, &y.content)?
+        }
         (Value::Shape(x), Value::Shape(y)) => x == y,
         (Value::Fun(_), Value::Fun(_)) => {
             return Err(Crash::new("cannot compare functions for equality"))
@@ -492,12 +571,16 @@ pub fn value_eq(a: &Value, b: &Value) -> Result<bool, Crash> {
     })
 }
 
-fn blob_content_eq(a: &BlobContent, b: &BlobContent) -> bool {
-    match (a, b) {
+/// content equality; two lazy blobs compare by content hash, without forcing
+fn blob_content_eq(a: &BlobContent, b: &BlobContent) -> Result<bool, Crash> {
+    Ok(match (a, b) {
         (BlobContent::Resolved(x), BlobContent::Resolved(y)) => x == y,
+        (BlobContent::Lazy(x), BlobContent::Lazy(y)) => x.id == y.id,
+        (BlobContent::Lazy(x), BlobContent::Resolved(y))
+        | (BlobContent::Resolved(y), BlobContent::Lazy(x)) => x.force()? == *y,
         (BlobContent::Conflict(x), BlobContent::Conflict(y)) => x == y,
         _ => false,
-    }
+    })
 }
 
 impl std::fmt::Debug for Value {

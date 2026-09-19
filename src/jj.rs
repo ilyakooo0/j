@@ -6,7 +6,7 @@
 use crate::config::Config;
 use crate::domain::{Backend, MetaInfo, ROOT_ID};
 use crate::eval::Interp;
-use crate::value::{BlobContent, BlobKind, BlobVal, Crash, Value};
+use crate::value::{BlobContent, BlobKind, BlobVal, Crash, LazyBlob, Value};
 use jj_lib::backend::{CopyId, Signature, Timestamp, TreeValue};
 use jj_lib::commit::Commit;
 use jj_lib::config::{ConfigLayer, ConfigSource, StackedConfig};
@@ -26,7 +26,8 @@ use jj_lib::settings::UserSettings;
 use jj_lib::store::Store;
 use jj_lib::working_copy::SnapshotOptions;
 use jj_lib::workspace::Workspace;
-use std::collections::{BTreeMap, BTreeSet};
+use std::cell::RefCell;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::future::Future;
 use std::os::unix::io::AsRawFd;
 use std::path::PathBuf;
@@ -366,11 +367,21 @@ impl JjBackend {
             // snapshot operation is written but unpublished — a persisting
             // run folds it into its own operation (§7.7)
             let (post, pending) = block_on(self.snapshot_repo())?;
-            *self.inner.pending.lock().unwrap() = pending;
-            let vis = block_on(read_visible(&post))?;
-            let cur = build_repo_value(&vis, &vis.wc_change_id)?;
-            *self.inner.visible.lock().unwrap() = Some(Arc::new(vis));
-            cur
+            match pending {
+                // no working-copy change: the repo is the one already loaded,
+                // so reuse its value instead of rebuilding it
+                None => {
+                    *self.inner.visible.lock().unwrap() = Some(Arc::new(loaded_visible));
+                    loaded.clone()
+                }
+                Some(pending) => {
+                    *self.inner.pending.lock().unwrap() = Some(pending);
+                    let vis = block_on(read_visible(&post))?;
+                    let cur = build_repo_value(&vis, &vis.wc_change_id)?;
+                    *self.inner.visible.lock().unwrap() = Some(Arc::new(vis));
+                    cur
+                }
+            }
         } else {
             *self.inner.visible.lock().unwrap() = Some(Arc::new(loaded_visible));
             loaded.clone()
@@ -603,6 +614,8 @@ impl JjBackend {
             old_stored = Arc::new(vis);
         }
         let mut written: BTreeMap<String, CommitId> = BTreeMap::new();
+        // shared across the whole persist walk so unchanged blobs are inflated once
+        let cache = BlobCache::default();
 
         // the root commit must be the top and unchanged (§7.5 step 4)
         let top = crate::repo::by_id(new, ROOT_ID)?
@@ -621,7 +634,7 @@ impl JjBackend {
             if root_jj.description() != msg {
                 return Err(Crash::new("persistence: the root commit cannot be changed"));
             }
-            let stored_files = block_on(tree_to_files(&store, &root_jj.tree()))
+            let stored_files = block_on(tree_to_files(&store, &root_jj.tree(), &cache))
                 .map_err(|e| Crash::new(e.msg))?;
             if !crate::value::value_eq(
                 &Value::list(stored_files),
@@ -669,7 +682,8 @@ impl JjBackend {
                     let stored_commit = &stored.commit;
                     let parent_changed = hex_of(stored_commit.parent_ids().first()) != parent_jj.hex();
                     let files_changed = {
-                        let stored_files = block_on(tree_to_files(&store, &stored_commit.tree()))?;
+                        let stored_files =
+                            block_on(tree_to_files(&store, &stored_commit.tree(), &cache))?;
                         !crate::value::value_eq(
                             &Value::list(stored_files),
                             &Value::list(files_v.as_list()?.to_vec()),
@@ -1800,7 +1814,7 @@ async fn jj_replay(
         .map_err(|e| Crash::new(format!("replay: {}", e)))?;
     // conflicts stay as unresolved blobs (§7.3)
     let merged = MergedTree::new(store.clone(), merged, jj_lib::conflict_labels::ConflictLabels::unlabeled());
-    tree_to_files(store, &merged).await
+    tree_to_files(store, &merged, &BlobCache::default()).await
 }
 
 // ----------------------------------------------------------------------
@@ -1843,6 +1857,17 @@ async fn blob_to_tree_value(store: &Arc<Store>, content: &Value) -> Result<Merge
         return Err(Crash::new("persistence: content is not a Blob"));
     };
     match &b.content {
+        // an unchanged blob loaded from this same store: reuse its file id
+        // instead of inflating and rewriting the bytes
+        BlobContent::Lazy(l) => {
+            let id = FileId::try_from_hex(&l.id)
+                .ok_or_else(|| Crash::new("persistence: bad blob id".to_string()))?;
+            Ok(ConflictTreeValue::resolved(TreeValue::File {
+                id,
+                executable: b.kind == BlobKind::Executable,
+                copy_id: CopyId::placeholder(),
+            }))
+        }
         BlobContent::Resolved(bytes) if b.kind == BlobKind::Symlink => {
             let target = std::str::from_utf8(bytes)
                 .map_err(|_| Crash::new("persistence: symlink target is not UTF-8"))?;
@@ -1911,7 +1936,31 @@ fn to_repo_path(path: &[String]) -> Result<RepoPathBuf, Crash> {
 // jj trees -> values
 // ----------------------------------------------------------------------
 
-async fn read_file_bytes(store: &Arc<Store>, path: &RepoPath, id: &FileId) -> Result<Vec<u8>, Crash> {
+/// blob contents keyed by file id, shared across the whole repo load: most
+/// files are unchanged between commits, so inflating each blob once (instead
+/// of once per commit that references it) keeps loading linear in the
+/// repository's unique data rather than commits × files
+#[derive(Default)]
+struct BlobCache(RefCell<HashMap<FileId, Rc<Vec<u8>>>>);
+
+impl BlobCache {
+    fn get(&self, id: &FileId) -> Option<Rc<Vec<u8>>> {
+        self.0.borrow().get(id).cloned()
+    }
+    fn insert(&self, id: FileId, bytes: Rc<Vec<u8>>) {
+        self.0.borrow_mut().insert(id, bytes);
+    }
+}
+
+async fn read_file_bytes(
+    store: &Arc<Store>,
+    path: &RepoPath,
+    id: &FileId,
+    cache: &BlobCache,
+) -> Result<Rc<Vec<u8>>, Crash> {
+    if let Some(bytes) = cache.get(id) {
+        return Ok(bytes);
+    }
     use futures::AsyncReadExt;
     let mut reader = store
         .read_file(path, id)
@@ -1922,6 +1971,8 @@ async fn read_file_bytes(store: &Arc<Store>, path: &RepoPath, id: &FileId) -> Re
         .read_to_end(&mut buf)
         .await
         .map_err(|e| Crash::new(format!("cannot read a file: {}", e)))?;
+    let buf = Rc::new(buf);
+    cache.insert(id.clone(), buf.clone());
     Ok(buf)
 }
 
@@ -1929,15 +1980,16 @@ async fn side_to_bytes(
     store: &Arc<Store>,
     path: &RepoPath,
     v: &Option<TreeValue>,
-) -> Result<Vec<u8>, Crash> {
+    cache: &BlobCache,
+) -> Result<Rc<Vec<u8>>, Crash> {
     match v {
-        Some(TreeValue::File { id, .. }) => read_file_bytes(store, path, id).await,
+        Some(TreeValue::File { id, .. }) => read_file_bytes(store, path, id, cache).await,
         Some(TreeValue::Symlink(id)) => store
             .read_symlink(path, id)
             .await
-            .map(|s| s.into_bytes())
+            .map(|s| Rc::new(s.into_bytes()))
             .map_err(|e| Crash::new(format!("cannot read a symlink: {}", e))),
-        _ => Ok(Vec::new()),
+        _ => Ok(Rc::new(Vec::new())),
     }
 }
 
@@ -1945,6 +1997,7 @@ async fn merged_value_to_blob(
     store: &Arc<Store>,
     path: &RepoPath,
     value: &jj_lib::backend::MergedTreeValue,
+    cache: &BlobCache,
 ) -> Result<Value, Crash> {
     if let Some(v) = value.as_resolved() {
         return match v {
@@ -1958,9 +2011,9 @@ async fn merged_value_to_blob(
     // conflict sides, jj order: [add, (remove, add)*] (§7.3)
     let mut sides: Vec<Rc<Vec<u8>>> = Vec::new();
     for (i, add) in value.adds().enumerate() {
-        sides.push(Rc::new(side_to_bytes(store, path, add).await?));
+        sides.push(side_to_bytes(store, path, add, cache).await?);
         if let Some(remove) = value.get_remove(i) {
-            sides.push(Rc::new(side_to_bytes(store, path, remove).await?));
+            sides.push(side_to_bytes(store, path, remove, cache).await?);
         }
     }
     Ok(Value::Blob(Rc::new(BlobVal {
@@ -1976,14 +2029,30 @@ async fn tree_value_to_blob(
 ) -> Result<Value, Crash> {
     match value {
         TreeValue::File { id, executable, .. } => {
-            let buf = read_file_bytes(store, path, id).await?;
+            // lazy: the bytes are read from the store only if an expression
+            // actually looks at them; equality and persistence use `id`
+            let id_hex = id.hex();
+            let store2 = store.clone();
+            let path2 = path.to_owned();
+            let id2 = id.clone();
+            let lazy = LazyBlob::new(id_hex, move || {
+                let mut reader = block_on(store2.read_file(&path2, &id2))
+                    .map_err(|e| Crash::new(format!("cannot read a file: {}", e)))?;
+                let mut buf = Vec::new();
+                {
+                    use futures::AsyncReadExt;
+                    block_on(reader.read_to_end(&mut buf))
+                        .map_err(|e| Crash::new(format!("cannot read a file: {}", e)))?;
+                }
+                Ok(Rc::new(buf))
+            });
             Ok(Value::Blob(Rc::new(BlobVal {
                 kind: if *executable {
                     BlobKind::Executable
                 } else {
                     BlobKind::Regular
                 },
-                content: BlobContent::Resolved(Rc::new(buf)),
+                content: BlobContent::Lazy(Rc::new(lazy)),
             })))
         }
         TreeValue::Symlink(id) => {
@@ -2005,7 +2074,11 @@ async fn tree_value_to_blob(
     }
 }
 
-async fn tree_to_files(store: &Arc<Store>, tree: &MergedTree) -> Result<Vec<Value>, Crash> {
+async fn tree_to_files(
+    store: &Arc<Store>,
+    tree: &MergedTree,
+    cache: &BlobCache,
+) -> Result<Vec<Value>, Crash> {
     let mut out = Vec::new();
     for (path, value) in tree.entries() {
         let value = value.map_err(|e| Crash::new(format!("cannot read a tree entry: {}", e)))?;
@@ -2013,7 +2086,7 @@ async fn tree_to_files(store: &Arc<Store>, tree: &MergedTree) -> Result<Vec<Valu
             .components()
             .map(|c| c.as_internal_str().to_string())
             .collect();
-        let content = merged_value_to_blob(store, &path, &value).await?;
+        let content = merged_value_to_blob(store, &path, &value, cache).await?;
         let p = Value::list(comps.into_iter().map(Value::text).collect());
         out.push(Value::record(&[("content", content), ("path", p)]));
     }
@@ -2057,7 +2130,8 @@ fn build_repo_value(vis: &VisibleRepo, focus_change: &str) -> Result<Value, Open
         .get(ROOT_ID)
         .ok_or_else(|| (2, "no root commit".to_string()))?;
     let store = root_rec.commit.store().clone();
-    let mut subtree = build_subtree(vis, root_rec, &store)?;
+    let cache = BlobCache::default();
+    let mut subtree = build_subtree(vis, root_rec, &store, &cache)?;
     sort_subtree(&mut subtree, vis);
     let top = Value::record(&[
         ("children", subtree.field("children").map_err(|e| (2, e.msg))?),
@@ -2074,8 +2148,10 @@ fn build_subtree(
     vis: &VisibleRepo,
     rec: &StoredCommit,
     store: &Arc<Store>,
+    cache: &BlobCache,
 ) -> Result<Value, OpenError> {
-    let files = block_on(tree_to_files(store, &rec.commit.tree())).map_err(|c| (2, c.msg))?;
+    let files =
+        block_on(tree_to_files(store, &rec.commit.tree(), cache)).map_err(|c| (2, c.msg))?;
     let labels: Vec<Value> = vis
         .labels
         .get(&rec.change_id)
@@ -2094,7 +2170,7 @@ fn build_subtree(
     if let Some(kids) = vis.children.get(&rec.change_id) {
         for kid in kids {
             if let Some(krec) = vis.commits.get(kid) {
-                children.push(build_subtree(vis, krec, store)?);
+                children.push(build_subtree(vis, krec, store, cache)?);
             }
         }
     }
