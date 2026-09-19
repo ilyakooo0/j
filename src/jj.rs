@@ -616,6 +616,7 @@ impl JjBackend {
         let mut written: BTreeMap<String, CommitId> = BTreeMap::new();
         // shared across the whole persist walk so unchanged blobs are inflated once
         let cache = BlobCache::default();
+        let entries = EntryCache::default();
 
         // the root commit must be the top and unchanged (§7.5 step 4)
         let top = crate::repo::by_id(new, ROOT_ID)?
@@ -634,7 +635,7 @@ impl JjBackend {
             if root_jj.description() != msg {
                 return Err(Crash::new("persistence: the root commit cannot be changed"));
             }
-            let stored_files = block_on(tree_to_files(&store, &root_jj.tree(), &cache))
+            let stored_files = block_on(tree_to_files(&store, &root_jj.tree(), &cache, &entries))
                 .map_err(|e| Crash::new(e.msg))?;
             if !crate::value::value_eq(
                 &Value::list(stored_files),
@@ -683,7 +684,7 @@ impl JjBackend {
                     let parent_changed = hex_of(stored_commit.parent_ids().first()) != parent_jj.hex();
                     let files_changed = {
                         let stored_files =
-                            block_on(tree_to_files(&store, &stored_commit.tree(), &cache))?;
+                            block_on(tree_to_files(&store, &stored_commit.tree(), &cache, &entries))?;
                         !crate::value::value_eq(
                             &Value::list(stored_files),
                             &Value::list(files_v.as_list()?.to_vec()),
@@ -1814,7 +1815,7 @@ async fn jj_replay(
         .map_err(|e| Crash::new(format!("replay: {}", e)))?;
     // conflicts stay as unresolved blobs (§7.3)
     let merged = MergedTree::new(store.clone(), merged, jj_lib::conflict_labels::ConflictLabels::unlabeled());
-    tree_to_files(store, &merged, &BlobCache::default()).await
+    tree_to_files(store, &merged, &BlobCache::default(), &EntryCache::default()).await
 }
 
 // ----------------------------------------------------------------------
@@ -1952,6 +1953,21 @@ impl BlobCache {
     }
 }
 
+/// whole file *entries* ({path, content}) keyed by (path, blob identity),
+/// shared across the whole repo load: an unchanged file is the same Value in
+/// every commit, so it is built once and cloned (an Rc bump) thereafter
+#[derive(Default)]
+struct EntryCache(RefCell<HashMap<String, Value>>);
+
+impl EntryCache {
+    fn get(&self, key: &str) -> Option<Value> {
+        self.0.borrow().get(key).cloned()
+    }
+    fn insert(&self, key: String, entry: Value) {
+        self.0.borrow_mut().insert(key, entry);
+    }
+}
+
 async fn read_file_bytes(
     store: &Arc<Store>,
     path: &RepoPath,
@@ -2078,17 +2094,40 @@ async fn tree_to_files(
     store: &Arc<Store>,
     tree: &MergedTree,
     cache: &BlobCache,
+    entries: &EntryCache,
 ) -> Result<Vec<Value>, Crash> {
     let mut out = Vec::new();
     for (path, value) in tree.entries() {
         let value = value.map_err(|e| Crash::new(format!("cannot read a tree entry: {}", e)))?;
-        let comps: Vec<String> = path
-            .components()
-            .map(|c| c.as_internal_str().to_string())
-            .collect();
-        let content = merged_value_to_blob(store, &path, &value, cache).await?;
-        let p = Value::list(comps.into_iter().map(Value::text).collect());
-        out.push(Value::record(&[("content", content), ("path", p)]));
+        // cache key: the entry is fully determined by its path and the
+        // identity of its (resolved) content; conflicts are not cached
+        let key = match value.as_resolved() {
+            Some(Some(TreeValue::File { id, executable, .. })) => Some(format!(
+                "F\u{0}{}\u{0}{}\u{0}{}",
+                path.as_internal_file_string(),
+                id.hex(),
+                executable
+            )),
+            // symlinks and directories are cheap; conflicts are rare — neither cached
+            _ => None,
+        };
+        let entry = match key.as_ref().and_then(|k| entries.get(k)) {
+            Some(e) => e,
+            None => {
+                let comps: Vec<String> = path
+                    .components()
+                    .map(|c| c.as_internal_str().to_string())
+                    .collect();
+                let content = merged_value_to_blob(store, &path, &value, cache).await?;
+                let p = Value::list(comps.into_iter().map(Value::text).collect());
+                let e = Value::record(&[("content", content), ("path", p)]);
+                if let Some(k) = key {
+                    entries.insert(k, e.clone());
+                }
+                e
+            }
+        };
+        out.push(entry);
     }
     Ok(out)
 }
@@ -2131,7 +2170,8 @@ fn build_repo_value(vis: &VisibleRepo, focus_change: &str) -> Result<Value, Open
         .ok_or_else(|| (2, "no root commit".to_string()))?;
     let store = root_rec.commit.store().clone();
     let cache = BlobCache::default();
-    let mut subtree = build_subtree(vis, root_rec, &store, &cache)?;
+    let entries = EntryCache::default();
+    let mut subtree = build_subtree(vis, root_rec, &store, &cache, &entries)?;
     sort_subtree(&mut subtree, vis);
     let top = Value::record(&[
         ("children", subtree.field("children").map_err(|e| (2, e.msg))?),
@@ -2149,9 +2189,10 @@ fn build_subtree(
     rec: &StoredCommit,
     store: &Arc<Store>,
     cache: &BlobCache,
+    entries: &EntryCache,
 ) -> Result<Value, OpenError> {
     let files =
-        block_on(tree_to_files(store, &rec.commit.tree(), cache)).map_err(|c| (2, c.msg))?;
+        block_on(tree_to_files(store, &rec.commit.tree(), cache, entries)).map_err(|c| (2, c.msg))?;
     let labels: Vec<Value> = vis
         .labels
         .get(&rec.change_id)
@@ -2170,7 +2211,7 @@ fn build_subtree(
     if let Some(kids) = vis.children.get(&rec.change_id) {
         for kid in kids {
             if let Some(krec) = vis.commits.get(kid) {
-                children.push(build_subtree(vis, krec, store, cache)?);
+                children.push(build_subtree(vis, krec, store, cache, entries)?);
             }
         }
     }
