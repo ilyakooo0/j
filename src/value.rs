@@ -18,6 +18,66 @@ pub enum Value {
     Id(Rc<String>),
     Blob(Rc<BlobVal>),
     Shape(Rc<ShapeVal>),
+    /// a value computed on first use (§2): currently used for a commit's
+    /// `files` list, so loading a repo does not materialize every commit's
+    /// file list. Forced transparently by `Value::field` and `value_eq`.
+    Thunk(Rc<ThunkVal>),
+}
+
+pub struct ThunkVal {
+    state: std::cell::RefCell<ThunkState>,
+}
+
+enum ThunkState {
+    Pending(Box<dyn FnOnce() -> Result<Value, Crash>>),
+    Ready(Value),
+}
+
+impl std::fmt::Debug for ThunkVal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &*self.state.borrow() {
+            ThunkState::Pending(_) => write!(f, "Thunk(pending)"),
+            ThunkState::Ready(v) => write!(f, "Thunk({:?})", v),
+        }
+    }
+}
+
+impl ThunkVal {
+    pub fn new(f: impl FnOnce() -> Result<Value, Crash> + 'static) -> Self {
+        ThunkVal {
+            state: std::cell::RefCell::new(ThunkState::Pending(Box::new(f))),
+        }
+    }
+
+    /// the value, computing it on first call and memoizing
+    pub fn force(&self) -> Result<Value, Crash> {
+        if let ThunkState::Ready(v) = &*self.state.borrow() {
+            return Ok(v.clone());
+        }
+        let thunk = {
+            let mut st = self.state.borrow_mut();
+            match std::mem::replace(&mut *st, ThunkState::Ready(Value::Bool(false))) {
+                ThunkState::Pending(t) => t,
+                ThunkState::Ready(v) => {
+                    *st = ThunkState::Ready(v.clone());
+                    return Ok(v);
+                }
+            }
+        };
+        let v = thunk()?;
+        *self.state.borrow_mut() = ThunkState::Ready(v.clone());
+        Ok(v)
+    }
+}
+
+impl Value {
+    /// force a thunk; every other value is returned unchanged
+    pub fn forced(&self) -> Result<Value, Crash> {
+        match self {
+            Value::Thunk(t) => t.force(),
+            _ => Ok(self.clone()),
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -266,6 +326,9 @@ impl Value {
             Value::Id(_) => "Id",
             Value::Blob(_) => "Blob",
             Value::Shape(_) => "Shape",
+            // a thunk stands in for its eventual value (currently a list of
+            // file entries); kind_name is used in error messages
+            Value::Thunk(_) => "list",
         }
     }
 
@@ -282,7 +345,8 @@ impl Value {
             Value::Record(m) => m
                 .get(name)
                 .cloned()
-                .ok_or_else(|| Crash::new(format!("record has no field `{}`", name))),
+                .ok_or_else(|| Crash::new(format!("record has no field `{}`", name)))
+                .and_then(|v| v.forced()),
             _ => Err(Crash::new(format!(
                 "cannot select field `{}` from a {}",
                 name,
@@ -533,6 +597,13 @@ impl Env {
 // ----------------------------------------------------------------------
 
 pub fn value_eq(a: &Value, b: &Value) -> Result<bool, Crash> {
+    // force thunks at the boundary so callers never see them
+    if let Value::Thunk(_) = a {
+        return value_eq(&a.forced()?, b);
+    }
+    if let Value::Thunk(_) = b {
+        return value_eq(a, &b.forced()?);
+    }
     Ok(match (a, b) {
         (Value::Int(x), Value::Int(y)) => x == y,
         (Value::Text(x), Value::Text(y)) => x == y,
@@ -596,6 +667,7 @@ impl std::fmt::Debug for Value {
             Value::Fun(_) => write!(f, "Fun(..)"),
             Value::Blob(b) => write!(f, "Blob({:?})", b),
             Value::Shape(s) => write!(f, "Shape({})", s.name),
+            Value::Thunk(t) => write!(f, "{:?}", t),
         }
     }
 }

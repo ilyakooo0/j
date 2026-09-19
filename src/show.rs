@@ -14,6 +14,10 @@ pub fn show(interp: &Interp, v: &Value) -> String {
 
 fn render(interp: &Interp, v: &Value) -> String {
     match v {
+        Value::Thunk(t) => match t.force() {
+            Ok(v) => render(interp, &v),
+            Err(_) => "<lazy>".to_string(),
+        },
         Value::Int(n) => {
             if n.sign() == num_bigint::Sign::Minus {
                 format!("(0 - {})", n.magnitude())

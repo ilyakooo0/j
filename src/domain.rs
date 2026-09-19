@@ -42,6 +42,16 @@ pub trait Backend {
     fn meta(&self, id: &str) -> Result<MetaInfo, Crash>;
     /// True if the change id denotes a merge commit (2+ parents).
     fn is_merge(&self, id: &str) -> bool;
+    /// True if the commit's tree contains a conflict, if the backend can say
+    /// without reading files (jj: O(1)); None means "unknown, compare files".
+    fn has_conflict(&self, _id: &str) -> Option<bool> {
+        None
+    }
+    /// True if the commit's tree equals its first parent's tree, if the
+    /// backend can say without reading files; None means "compare files".
+    fn is_empty(&self, _id: &str) -> Option<bool> {
+        None
+    }
     /// All ancestors (inclusive) of the given change ids.
     fn ancestors_closed(&self, ids: &BTreeSet<String>) -> BTreeSet<String>;
 

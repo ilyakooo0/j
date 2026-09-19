@@ -1763,6 +1763,22 @@ impl Backend for JjBackend {
             .unwrap_or(false)
     }
 
+    fn has_conflict(&self, id: &str) -> Option<bool> {
+        let vis = self.inner.visible.lock().unwrap().clone();
+        // O(1): a commit is conflicted iff its tree id is an unresolved merge
+        vis.and_then(|v| v.commits.get(id).map(|r| r.commit.has_conflict()))
+    }
+
+    fn is_empty(&self, id: &str) -> Option<bool> {
+        let vis = self.inner.visible.lock().unwrap().clone();
+        // O(1): empty iff the tree id equals the first parent's tree id
+        vis.and_then(|v| {
+            let rec = v.commits.get(id)?;
+            let parent = v.commits.get(&rec.first_parent)?;
+            Some(rec.commit.tree_ids() == parent.commit.tree_ids())
+        })
+    }
+
     fn ancestors_closed(&self, ids: &BTreeSet<String>) -> BTreeSet<String> {
         let vis = self.inner.visible.lock().unwrap().clone();
         let Some(vis) = vis else {
@@ -1941,8 +1957,8 @@ fn to_repo_path(path: &[String]) -> Result<RepoPathBuf, Crash> {
 /// files are unchanged between commits, so inflating each blob once (instead
 /// of once per commit that references it) keeps loading linear in the
 /// repository's unique data rather than commits × files
-#[derive(Default)]
-struct BlobCache(RefCell<HashMap<FileId, Rc<Vec<u8>>>>);
+#[derive(Clone, Default)]
+struct BlobCache(Rc<RefCell<HashMap<FileId, Rc<Vec<u8>>>>>);
 
 impl BlobCache {
     fn get(&self, id: &FileId) -> Option<Rc<Vec<u8>>> {
@@ -1956,8 +1972,8 @@ impl BlobCache {
 /// whole file *entries* ({path, content}) keyed by (path, blob identity),
 /// shared across the whole repo load: an unchanged file is the same Value in
 /// every commit, so it is built once and cloned (an Rc bump) thereafter
-#[derive(Default)]
-struct EntryCache(RefCell<HashMap<String, Value>>);
+#[derive(Clone, Default)]
+struct EntryCache(Rc<RefCell<HashMap<String, Value>>>);
 
 impl EntryCache {
     fn get(&self, key: &str) -> Option<Value> {
@@ -2191,8 +2207,18 @@ fn build_subtree(
     cache: &BlobCache,
     entries: &EntryCache,
 ) -> Result<Value, OpenError> {
-    let files =
-        block_on(tree_to_files(store, &rec.commit.tree(), cache, entries)).map_err(|c| (2, c.msg))?;
+    // the files list is lazy (§7.2): most commits are never inspected, so
+    // their file entries are materialized only on first `field("files")`
+    let files_thunk = {
+        let store = store.clone();
+        let tree = rec.commit.tree();
+        let cache = cache.clone();
+        let entries = entries.clone();
+        Value::Thunk(Rc::new(crate::value::ThunkVal::new(move || {
+            let files = block_on(tree_to_files(&store, &tree, &cache, &entries))?;
+            Ok(Value::list(files))
+        })))
+    };
     let labels: Vec<Value> = vis
         .labels
         .get(&rec.change_id)
@@ -2202,7 +2228,7 @@ fn build_subtree(
         .map(Value::text)
         .collect();
     let commit_v = Value::record(&[
-        ("files", Value::list(files)),
+        ("files", files_thunk),
         ("id", Value::Id(Rc::new(rec.change_id.clone()))),
         ("labels", Value::list(labels)),
         ("message", Value::text(rec.commit.description())),

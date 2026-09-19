@@ -191,7 +191,9 @@ fn display_id(interp: &Interp, id: &str, pal: &Palette) -> String {
 }
 
 fn display_line(interp: &Interp, v: &Value, pal: &Palette) -> Result<String, Crash> {
+    let v = &v.forced()?;
     match v {
+        Value::Thunk(_) => unreachable!("forced never returns a thunk"),
         Value::Int(n) => Ok(n.to_string()),
         Value::Bool(b) => Ok(b.to_string()),
         Value::Text(t) => {
@@ -463,7 +465,9 @@ fn display_block(
     out: &mut String,
 ) -> Result<(), Crash> {
     let pad = " ".repeat(indent);
+    let v = &v.forced()?;
     match v {
+        Value::Thunk(_) => unreachable!("forced never returns a thunk"),
         Value::Text(t) => {
             out.push_str(t);
             return Ok(());
@@ -1016,11 +1020,13 @@ fn build_info(
         .iter()
         .map(|l| l.as_text().map(|s| s.to_string()))
         .collect::<Result<_, _>>()?;
-    let conflict = has_conflict(commit)?;
-    let files = commit.field("files")?;
-    let nfiles = files.as_list()?.len();
-    // `empty` (no change against the parent) is needed at every detail level;
-    // compute it by id-based snapshot equality, which never forces blob bytes.
+    // conflict and empty are O(1) backend queries when the backend can answer
+    // them from tree ids (jj), without touching the file list at all; the
+    // in-memory backend cannot, so fall back to walking the files
+    let conflict = match interp.backend.has_conflict(&id) {
+        Some(c) => c,
+        None => has_conflict(commit)?,
+    };
     // `size` (a line count) and `detail_marks` are only rendered for detail ≥
     // 2 and for the focus and its neighbours, so skip the per-commit line
     // counting elsewhere — it dominates render time on large histories.
@@ -1030,16 +1036,29 @@ fn build_info(
             matches!(c.field("root").and_then(|r| r.field("id")), Ok(Value::Id(i)) if *i == focus_id)
         });
     let want_diff = opts.detail >= 2 || is_focus_pre || child_is_focus || parent_is_focus;
+    let backend_empty = interp.backend.is_empty(&id);
+    // the files list is only materialized when something needs it: the diff
+    // (detail/focus), the files data column, or the emptiness fallback
+    let need_files = want_diff || opts.files || backend_empty.is_none();
+    let files = if need_files {
+        Some(commit.field("files")?)
+    } else {
+        None
+    };
+    let nfiles = files.as_ref().map(|f| f.as_list().map(|l| l.len())).transpose()?.unwrap_or(0);
     let (empty, size, detail_marks) = match parent_files {
         Some(pf) => {
-            // empty ⟺ the snapshot equals the parent's (id-based, no forcing)
-            let empty = crate::value::value_eq(&files, pf)?;
+            let empty = match backend_empty {
+                Some(e) => e,
+                None => crate::value::value_eq(files.as_ref().expect("files loaded"), pf)?,
+            };
             if want_diff {
+                let files = files.as_ref().expect("files loaded");
                 let change = Value::record(&[("from", pf.clone()), ("to", files.clone())]);
                 let marks = touched_paths(&change)?;
                 // size: lines added+removed against the parent
                 let from_map = snapshot_map_of(pf)?;
-                let to_map = snapshot_map_of(&files)?;
+                let to_map = snapshot_map_of(files)?;
                 let mut lines = 0usize;
                 for (p, _, _) in &marks {
                     let key: Vec<String> = p.split('/').map(|s| s.to_string()).collect();
@@ -1065,7 +1084,7 @@ fn build_info(
             }
         }
         None => {
-            let n = files.as_list()?.len();
+            let n = nfiles;
             (n == 0 && id != ROOT_ID, None, Vec::new())
         }
     };
@@ -1082,13 +1101,12 @@ fn build_info(
             immutable,
             focus_id,
             anc,
-            Some(&files),
+            files.as_ref(),
             with_focus,
             is_ancestor_of_focus,
             is_focus_pre,
         )?);
-    }
-    let immutable_flag = immutable.contains(&id);
+    }    let immutable_flag = immutable.contains(&id);
     Ok(CommitInfo {
         id,
         message,
