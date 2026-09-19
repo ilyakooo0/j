@@ -94,6 +94,7 @@ pub fn all_builtins() -> Vec<(String, Value)> {
         builtin("splitOn", 2, b_split_on),
         builtin("replay", 2, b_replay),
         builtin("unresolved", 1, b_unresolved),
+        builtin("touchedPaths", 1, b_touched_paths),
         builtin("blob", 1, b_blob),
         builtin("text", 1, b_text),
         builtin("by", 2, b_by),
@@ -510,6 +511,30 @@ fn b_unresolved(_i: &mut Interp, args: &[Value]) -> BResult {
             v.kind_name()
         ))),
     }
+}
+
+/// the paths whose content differs between `from` and `to` snapshots (§7.3):
+/// one pass over both path-keyed maps, comparing blobs by content id — never
+/// reading file bytes. Replaces the quadratic `entryAt`-per-path scan.
+fn b_touched_paths(_i: &mut Interp, args: &[Value]) -> BResult {
+    let ch = &args[0];
+    let from = crate::domain::snapshot_map(ch.field("from")?.as_list()?)?;
+    let to = crate::domain::snapshot_map(ch.field("to")?.as_list()?)?;
+    let mut paths: std::collections::BTreeSet<Vec<String>> = std::collections::BTreeSet::new();
+    paths.extend(from.keys().cloned());
+    paths.extend(to.keys().cloned());
+    let mut out = Vec::new();
+    for p in paths {
+        let changed = match (from.get(&p), to.get(&p)) {
+            (None, Some(_)) | (Some(_), None) => true,
+            (Some(a), Some(b)) => !crate::value::value_eq(a, b)?,
+            (None, None) => false,
+        };
+        if changed {
+            out.push(Value::list(p.into_iter().map(Value::text).collect()));
+        }
+    }
+    Ok(Value::list(out))
 }
 
 fn b_blob(_i: &mut Interp, args: &[Value]) -> BResult {

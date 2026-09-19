@@ -141,6 +141,8 @@ splitOn    : Text -> Text -> [Text]        -- splitOn "/" "a/b" = ["a" "b"]
 -- path's blob is unresolved rather than an error.
 replay     : Snapshot -> Change -> Snapshot
 unresolved : Blob -> Bool
+touchedPaths : Change -> [Path]            -- paths whose content differs, one pass;
+                                           -- blobs compared by content id, bytes never read
 blob       : Text -> Blob                  -- a resolved regular file
 text       : Blob -> Text                  -- its content (markers if unresolved)
 by         : Id -> Repo -> Repo            -- focus the commit with this id; crash if absent
@@ -530,9 +532,7 @@ contentAt = \p s -> (head (entryAt p s)).content or blob ""
 
 -- The paths a change touches.
 touched : Change -> [Path]
-touched = \ch ->
-  let paths = map (.path) ch.to ++ filter (\p -> not (member p (map (.path) ch.to))) (map (.path) ch.from)
-  in filter (\p -> entryAt p ch.to /= entryAt p ch.from) paths
+touched = touchedPaths
 
 -- Paths whose content differs between the focus and its parent.
 changed : Repo -> [Path]
