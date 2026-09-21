@@ -328,3 +328,115 @@ fn entry_list_aligns_by_display_width() {
         out
     );
 }
+
+// ----------------------------------------------------------------------
+// The jj backend differs from the default in-memory one in two ways that
+// changed behaviour and were invisible to the suite: a commit's `files` is a
+// thunk until asked for, and `has_conflict`/`is_empty` are answered from tree
+// ids rather than by walking files. `MemBackend::answering` plus `lazy_files`
+// reproduce both.
+// ----------------------------------------------------------------------
+
+fn lazy_commit(id: &str, msg: &str, files: Vec<(&str, &str)>) -> Value {
+    let entries: Vec<Value> = files
+        .into_iter()
+        .map(|(p, c)| {
+            Value::record(&[
+                ("content", BlobVal::text_blob(c)),
+                ("path", Value::list(p.split('/').map(Value::text).collect())),
+            ])
+        })
+        .collect();
+    Value::record(&[
+        ("files", j::domain::lazy_files(entries)),
+        ("id", Value::Id(Rc::new(id.to_string()))),
+        ("labels", Value::list(vec![])),
+        ("message", Value::text(msg)),
+    ])
+}
+
+/// A linear repo of `n` commits above the root whose file lists are lazy,
+/// focused on the last. It has to be long enough that a commit in the middle
+/// has a parent nothing asked the files of — that is the case where emptiness
+/// had nothing to fall back on.
+fn lazy_repo_chain(n: usize) -> (Value, MemBackend) {
+    let ids: Vec<String> = (0..n).map(|k| format!("kpqx{:04}", k)).collect();
+    let mut be = MemBackend::answering();
+    be.metas.insert(ROOT_ID.to_string(), meta(ROOT_ID, "Root", 1_700_000_000).1);
+    be.parents.insert(ROOT_ID.to_string(), vec![]);
+    let mut frames: Vec<Value> = vec![Value::record(&[
+        ("left", Value::list(vec![])),
+        ("parent", lazy_commit(ROOT_ID, "", vec![])),
+        ("right", Value::list(vec![])),
+    ])];
+    let mut files: Vec<(String, String)> = Vec::new();
+    let mut focus = None;
+    for (k, id) in ids.iter().enumerate() {
+        files.push((format!("src/f{}.rs", k), format!("fn f{}() {{}}\n", k)));
+        let as_refs: Vec<(&str, &str)> =
+            files.iter().map(|(p, c)| (p.as_str(), c.as_str())).collect();
+        let c = lazy_commit(id, &format!("commit {}", k), as_refs);
+        be.metas.insert(id.clone(), meta(id, "M", 1_700_000_100 + k as i64).1);
+        let parent = if k == 0 { ROOT_ID.to_string() } else { ids[k - 1].clone() };
+        be.parents.insert(id.clone(), vec![parent]);
+        be.empties.insert(id.clone(), false);
+        if k + 1 == n {
+            focus = Some(c);
+        } else {
+            frames.push(Value::record(&[
+                ("left", Value::list(vec![])),
+                ("parent", c),
+                ("right", Value::list(vec![])),
+            ]));
+        }
+    }
+    frames.reverse();
+    let repo = Value::record(&[
+        ("children", Value::list(vec![])),
+        ("context", Value::list(frames)),
+        ("root", focus.unwrap()),
+    ]);
+    (repo, be)
+}
+
+fn lazy_repo() -> (Value, MemBackend) {
+    lazy_repo_chain(2)
+}
+
+#[test]
+fn lazy_file_lists_stay_invisible_to_the_language() {
+    // `extract` walked past an unforced `files` thunk, so it found nothing on
+    // a real repository while finding everything in memory
+    let (repo, be) = lazy_repo();
+    let (mut i, cfg) = make_interp(be);
+    for (src, want) in [
+        ("length (extract Entry repo)", "3"),
+        ("length (extract Blob repo)", "3"),
+        ("length (extract Commit repo)", "3"),
+        ("length (files repo)", "2"),
+    ] {
+        let out = eval_and_display(
+            &mut i,
+            &cfg,
+            &format!("(\\repo -> {})", src),
+            repo.clone(),
+        );
+        assert_eq!(out.trim(), want, "{}", src);
+    }
+}
+
+#[test]
+fn tree_emptiness_uses_the_backend_when_files_are_lazy() {
+    // `empty` fell back to a file count that is 0 whenever the list was never
+    // materialised, so a backend that answers `is_empty` (and therefore never
+    // forces the list) marked every commit empty
+    // six commits: the middle ones have a parent whose files nothing needs
+    let (repo, be) = lazy_repo_chain(6);
+    let (mut i, cfg) = make_interp(be);
+    let out = eval_and_display(&mut i, &cfg, "tree", repo);
+    let rows: Vec<&str> = out.lines().filter(|l| l.contains("commit ")).collect();
+    assert_eq!(rows.len(), 6, "{}", out);
+    for row in rows {
+        assert!(!row.contains('◌'), "wrongly marked empty: {:?}\n{}", row, out);
+    }
+}

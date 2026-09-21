@@ -1,7 +1,6 @@
 //! j — a functional-programming-centered CLI for jj repositories (§1).
 
 use j::config::{self, Config};
-use j::eval::Interp;
 use j::jj::JjBackend;
 use j::parse::parse_expr;
 use j::value::{Crash, Value};
@@ -15,6 +14,13 @@ const USAGE: &str = "usage: j EXPRESSION…   (or echo EXPRESSION | j)";
 fn err(status: u8, msg: impl std::fmt::Display) -> ExitCode {
     eprintln!("j: {}", msg);
     ExitCode::from(status)
+}
+
+/// Report a failure that ends the process, keeping the status as a number so
+/// callers do not have to recover it from an `ExitCode`.
+fn fail(status: u8, msg: impl std::fmt::Display) -> u8 {
+    eprintln!("j: {}", msg);
+    status
 }
 
 fn crash_err(c: &Crash, expr_text: Option<&str>) -> ExitCode {
@@ -42,7 +48,7 @@ fn config_path() -> String {
 /// installed (the share/j/config.j file may not exist next to the binary).
 const DEFAULT_CONFIG: &str = include_str!("../config.j");
 
-fn load_config_file() -> Result<(Config, String), ExitCode> {
+fn load_config_file() -> Result<(Config, String), u8> {
     let path = config_path();
     let src = match std::fs::read_to_string(&path) {
         Ok(s) => s,
@@ -50,18 +56,18 @@ fn load_config_file() -> Result<(Config, String), ExitCode> {
             // No user config yet: materialise the default there, editable by
             // the current user, so they have a starting point to customise.
             if let Err(e) = write_default_config(&path) {
-                return Err(err(3, format!("cannot create config at {}: {}", path, e)));
+                return Err(fail(3, format!("cannot create config at {}: {}", path, e)));
             }
             eprintln!("j: created an editable default config at {}", path);
             match std::fs::read_to_string(&path) {
                 Ok(s) => s,
-                Err(e) => return Err(err(3, format!("cannot read config at {}: {}", path, e))),
+                Err(e) => return Err(fail(3, format!("cannot read config at {}: {}", path, e))),
             }
         }
     };
     match config::load_config(&src) {
         Ok(c) => Ok((c, src)),
-        Err(e) => Err(err(3, e.message())),
+        Err(e) => Err(fail(3, e.message())),
     }
 }
 
@@ -95,18 +101,36 @@ fn main() -> ExitCode {
         .expect("worker thread panicked")
 }
 
+/// True when stdin has input (or end-of-input) waiting within `ms`
+/// milliseconds. A closed or exhausted stdin reports ready at once, so the
+/// wait is only paid for a pipe that is open but idle.
+fn stdin_is_ready(ms: i32) -> bool {
+    let mut fds = libc::pollfd {
+        fd: libc::STDIN_FILENO,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    unsafe { libc::poll(&mut fds, 1, ms) > 0 }
+}
+
 fn run() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    // §1: stdin vs arguments
+    // §1: stdin vs arguments. With no arguments the expression comes from
+    // stdin, so reading to end-of-input is the whole point. With arguments,
+    // stdin is only read to report the "both" error — and reading it blindly
+    // hangs whenever the process inherited a pipe nobody is writing to (a
+    // shell loop, a CI step), so wait only briefly for input to appear.
     let mut stdin_content = String::new();
     let stdin_has_data = {
         if std::io::stdin().is_terminal() {
             false
-        } else {
+        } else if args.is_empty() || stdin_is_ready(50) {
             match std::io::stdin().read_to_string(&mut stdin_content) {
                 Ok(n) => n > 0,
                 Err(_) => false,
             }
+        } else {
+            false
         }
     };
     if stdin_has_data && !args.is_empty() {
@@ -185,10 +209,10 @@ fn run_reserved(cmd: &str, text: &str) -> ExitCode {
             if rest.is_empty() {
                 return err(2, "usage: j push EXPR");
             }
-            let (cfg, _) = or_exit(load_config_file());
+            let (mut cfg, _) = or_exit(load_config_file());
             let backend = or_exit(open_repo_locked(&cfg));
             // evaluate EXPR against the recorded repository (no snapshot)
-            match backend.cmd_push(&cfg, rest) {
+            match backend.cmd_push(&mut cfg, rest) {
                 Ok(()) => ExitCode::SUCCESS,
                 Err(e) => err(e.0, e.1),
             }
@@ -232,58 +256,44 @@ fn default_clone_dir(url: &str) -> String {
     last.strip_suffix(".git").unwrap_or(last).to_string()
 }
 
-fn or_exit<T>(r: Result<T, ExitCode>) -> T {
+fn or_exit<T>(r: Result<T, u8>) -> T {
     match r {
         Ok(v) => v,
-        Err(c) => std::process::exit(exit_code_number(c)),
+        Err(code) => std::process::exit(code as i32),
     }
 }
 
-/// ExitCode doesn't expose its value; track it alongside.
-fn exit_code_number(c: ExitCode) -> i32 {
-    // ExitCode's Debug is "ExitCode(unix_exit_status(N))" on unix
-    let s = format!("{:?}", c);
-    for tok in s.split(|ch: char| !ch.is_ascii_digit()) {
-        if !tok.is_empty() {
-            if let Ok(n) = tok.parse() {
-                return n;
-            }
-        }
-    }
-    1
-}
-
-fn open_repo() -> Result<Rc<JjBackend>, ExitCode> {
+fn open_repo() -> Result<Rc<JjBackend>, u8> {
     match JjBackend::open(None) {
         Ok(b) => Ok(Rc::new(b)),
-        Err(e) => Err(err(e.0, e.1)),
+        Err(e) => Err(fail(e.0, e.1)),
     }
 }
 
-fn open_repo_noconfig() -> Result<Rc<JjBackend>, ExitCode> {
+fn open_repo_noconfig() -> Result<Rc<JjBackend>, u8> {
     // undo/redo/ops do not read the config (§6.1), but take the lock
     match JjBackend::open(None) {
         Ok(b) => {
             b.take_lock();
             Ok(Rc::new(b))
         }
-        Err(e) => Err(err(e.0, e.1)),
+        Err(e) => Err(fail(e.0, e.1)),
     }
 }
 
-fn open_repo_locked(cfg: &Config) -> Result<Rc<JjBackend>, ExitCode> {
+fn open_repo_locked(cfg: &Config) -> Result<Rc<JjBackend>, u8> {
     match JjBackend::open(Some(cfg)) {
         Ok(b) => {
             b.take_lock();
             Ok(Rc::new(b))
         }
-        Err(e) => Err(err(e.0, e.1)),
+        Err(e) => Err(fail(e.0, e.1)),
     }
 }
 
 fn run_expression(text: &str, snapshot: bool) -> ExitCode {
     // §1.2.1: locate the repository
-    let (cfg, _cfg_src) = or_exit(load_config_file());
+    let (mut cfg, _cfg_src) = or_exit(load_config_file());
     let backend = or_exit(open_repo_locked(&cfg));
 
     // §1.2.2: parse the expression
@@ -295,23 +305,15 @@ fn run_expression(text: &str, snapshot: bool) -> ExitCode {
 
     // §1.2.4: build the current repository value (with snapshot)
     let (mut interp, loaded_repo, current_repo) =
-        match backend.build_interp(&cfg, text, snapshot) {
+        match backend.build_interp(&mut cfg, text, snapshot) {
             Ok(t) => t,
             Err((2, m)) => return err(2, m),
+            Err((3, m)) => return err(3, m),
             Err((_, m)) => return err(1, m),
         };
 
-    // §1.2.5: resolve Id literals in config and expression
-    for (def_name, prefix, candidates) in config::config_id_failures(&cfg, &interp) {
-        let _ = candidates;
-        return err(
-            3,
-            format!(
-                "config.j: `@{}` in `{}` does not resolve to a unique commit",
-                prefix, def_name
-            ),
-        );
-    }
+    // §1.2.5: the config's Id literals were resolved by build_interp, as soon
+    // as the visible ids were known; the expression's are resolved here
     expr = match config::resolve_ids(&expr, &interp) {
         Ok(e) => e,
         Err(failures) => {
@@ -349,7 +351,7 @@ fn run_expression(text: &str, snapshot: bool) -> ExitCode {
     }
 
     // §1.2.8: a Repo is persisted (unless unchanged)
-    if is_repo_value(&interp, &v) {
+    if is_repo_value(&v) {
         match backend.persist(&mut interp, &cfg, &loaded_repo, &current_repo, &v, text) {
             Ok(()) => ExitCode::SUCCESS,
             Err(c) => crash_err(&c, Some(text)),
@@ -367,7 +369,7 @@ fn run_expression(text: &str, snapshot: bool) -> ExitCode {
     }
 }
 
-fn is_repo_value(interp: &Interp, v: &Value) -> bool {
+fn is_repo_value(v: &Value) -> bool {
     // §4.4: shape Repo and root's shape Commit
     let fields = match v {
         Value::Record(m) => m.keys().cloned().collect::<BTreeSet<String>>(),
@@ -392,6 +394,5 @@ fn is_repo_value(interp: &Interp, v: &Value) -> bool {
         .iter()
         .map(|s| s.to_string())
         .collect();
-    let _ = interp;
     root_fields == want_root
 }

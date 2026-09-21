@@ -464,17 +464,29 @@ fn resolve_ids_rec(
     }
 }
 
-/// find Id literals per definition for config validation (§6.2.5)
-pub fn config_id_failures(
-    cfg: &Config,
+/// Resolve every `@prefix` literal in the config's definitions against the
+/// visible ids, in place (§1.2.5: "in `config.j`, every literal is resolved at
+/// load"). Returns the ones that did not resolve to exactly one commit, as
+/// (definition, prefix, candidates); those definitions are left untouched.
+///
+/// Checking without rewriting is not enough: an unresolved literal reaching
+/// the evaluator crashes with `internal: unresolved id literal`, and because a
+/// lambda body is not evaluated at load, it does so only when the definition
+/// is eventually used.
+pub fn resolve_config_ids(
+    cfg: &mut Config,
     interp: &Interp,
 ) -> Vec<(String, String, Vec<String>)> {
     let mut out = Vec::new();
-    for (name, expr) in &cfg.defs {
+    for (name, expr) in cfg.defs.iter_mut() {
         let mut failures = Vec::new();
-        resolve_ids_rec(expr, interp, &mut failures);
-        for (prefix, matches) in failures {
-            out.push((name.clone(), prefix, matches));
+        let resolved = resolve_ids_rec(expr, interp, &mut failures);
+        if failures.is_empty() {
+            *expr = Rc::new(resolved);
+        } else {
+            for (prefix, matches) in failures {
+                out.push((name.clone(), prefix, matches));
+            }
         }
     }
     out

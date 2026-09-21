@@ -237,15 +237,40 @@ pub struct MemBackend {
     pub metas: HashMap<String, MetaInfo>,
     /// id -> parent change ids (first parent first)
     pub parents: HashMap<String, Vec<String>>,
+    /// Answer `has_conflict` and `is_empty` from the two maps below instead of
+    /// returning None, the way the jj backend answers them from tree ids. A
+    /// backend that answers them takes different paths through rendering and
+    /// never forces a commit's file list, so tests that only ever used the
+    /// None-answering default could not reach those paths at all.
+    pub answers_tree_queries: bool,
+    /// id -> the commit's tree holds a conflict
+    pub conflicts: HashMap<String, bool>,
+    /// id -> the commit's tree equals its first parent's
+    pub empties: HashMap<String, bool>,
 }
 
 impl MemBackend {
     pub fn new() -> Self {
+        MemBackend::default()
+    }
+
+    /// A backend that answers the tree queries, like the jj backend does.
+    pub fn answering() -> Self {
         MemBackend {
-            metas: HashMap::new(),
-            parents: HashMap::new(),
+            answers_tree_queries: true,
+            ..MemBackend::default()
         }
     }
+}
+
+/// A snapshot that is only materialised on first use, the way the jj backend
+/// builds a commit's `files` (§7.2). The laziness must stay invisible to the
+/// language, which is exactly what is easy to get wrong, so tests need to be
+/// able to build repos this way.
+pub fn lazy_files(entries: Vec<Value>) -> Value {
+    Value::Thunk(Rc::new(crate::value::ThunkVal::new(move || {
+        Ok(Value::list(entries))
+    })))
 }
 
 impl Backend for MemBackend {
@@ -258,10 +283,24 @@ impl Backend for MemBackend {
         self.metas
             .get(id)
             .cloned()
-            .ok_or_else(|| Crash::new(format!("meta: no stored commit for id")))
+            .ok_or_else(|| Crash::new(format!("meta: no stored commit for `{}`", id)))
     }
     fn is_merge(&self, id: &str) -> bool {
         self.parents.get(id).map(|p| p.len() >= 2).unwrap_or(false)
+    }
+    fn has_conflict(&self, id: &str) -> Option<bool> {
+        if !self.answers_tree_queries {
+            return None;
+        }
+        Some(self.conflicts.get(id).copied().unwrap_or(false))
+    }
+    fn is_empty(&self, id: &str) -> Option<bool> {
+        if !self.answers_tree_queries {
+            return None;
+        }
+        // like jj: only answerable against a recorded first parent
+        self.parents.get(id)?.first()?;
+        Some(self.empties.get(id).copied().unwrap_or(false))
     }
     fn ancestors_closed(&self, ids: &BTreeSet<String>) -> BTreeSet<String> {
         let mut seen = BTreeSet::new();

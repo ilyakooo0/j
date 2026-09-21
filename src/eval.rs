@@ -30,6 +30,43 @@ pub struct Interp {
     /// history. The `Rc` is kept so the address cannot be reused while it is
     /// a key (§4.1: definitions are pure, so the result cannot change).
     revsets: RefCell<Vec<(&'static str, Rc<crate::value::RecordMap>, Value)>>,
+    /// visible ids in sorted order, built on first use. The backend's
+    /// `visible_ids` allocates every id afresh, and a shortest-unique-prefix
+    /// needs the whole set, so computing one per displayed commit was
+    /// quadratic in both allocations and comparisons.
+    sorted_ids: RefCell<Option<Rc<Vec<String>>>>,
+}
+
+/// length of the common leading run of two ids (ids are ASCII, so bytes)
+fn common_prefix_len(a: &str, b: &str) -> usize {
+    a.bytes()
+        .zip(b.bytes())
+        .take_while(|(x, y)| x == y)
+        .count()
+}
+
+/// The shortest prefix of `id` that no other id in `sorted` shares, at least
+/// four characters long. Only the neighbours of `id` in sorted order can share
+/// its longest prefix, so two lookups settle it.
+pub fn unique_prefix_in(sorted: &[String], id: &str) -> String {
+    let pos = sorted.partition_point(|o| o.as_str() < id);
+    let mut shared = 0usize;
+    if pos > 0 {
+        shared = shared.max(common_prefix_len(&sorted[pos - 1], id));
+    }
+    let mut next = pos;
+    while next < sorted.len() && sorted[next] == id {
+        next += 1;
+    }
+    if next < sorted.len() {
+        shared = shared.max(common_prefix_len(&sorted[next], id));
+    }
+    let n = 4.max(shared + 1);
+    if n >= id.len() {
+        id.to_string()
+    } else {
+        id[..n].to_string()
+    }
 }
 
 /// machine state
@@ -179,7 +216,25 @@ impl Interp {
             current_def: RefCell::new(None),
             old_repo: RefCell::new(None),
             revsets: RefCell::new(Vec::new()),
+            sorted_ids: RefCell::new(None),
         }
+    }
+
+    /// Shortest prefix of `id` unique among the visible ids, minimum four
+    /// (§5.1). The sorted id list is built once per run.
+    pub fn unique_prefix(&self, id: &str) -> String {
+        let cached = self.sorted_ids.borrow().clone();
+        let sorted = match cached {
+            Some(s) => s,
+            None => {
+                let mut ids = self.backend.visible_ids();
+                ids.sort();
+                let rc = Rc::new(ids);
+                *self.sorted_ids.borrow_mut() = Some(rc.clone());
+                rc
+            }
+        };
+        unique_prefix_in(&sorted, id)
     }
 
     /// Apply one of the config revsets the binary calls itself, reusing the
@@ -219,6 +274,7 @@ impl Interp {
             current_def: RefCell::new(None),
             old_repo: RefCell::new(None),
             revsets: RefCell::new(Vec::new()),
+            sorted_ids: RefCell::new(None),
         }
     }
 
@@ -296,26 +352,18 @@ impl Interp {
                 Run::Step(next) => st = next,
                 Run::Done(v) => return Ok(v),
                 Run::Crash(c) => {
-                    // unwind to the nearest Try continuation, restoring the
+                    // Unwind to the nearest Try continuation, restoring the
                     // fresh-id snapshot so a caught crash leaves no trace.
-                    // A `Shared` continuation links back to a context already
-                    // containing a Try, so track visited Try nodes and skip
-                    // ones already unwound past (a caught crash must not be
-                    // re-caught by the same Try, which would loop forever).
+                    // A Try cannot catch a crash raised by its own handler:
+                    // every `on_crash` state continues through `Cont::Shared`
+                    // holding the continuation *outside* the Try, so the Try
+                    // is no longer on the chain once the handler runs.
                     let mut k = Some(active.clone());
-                    let mut visited: Vec<*const Cont> = Vec::new();
                     let caught = loop {
                         match k {
                             Some(Cont::Try {
                                 snapshot, on_crash, ..
                             }) => {
-                                let ptr = &*on_crash as *const State as *const Cont;
-                                let already = visited.contains(&ptr);
-                                visited.push(ptr);
-                                if already {
-                                    k = None;
-                                    continue;
-                                }
                                 *self.fresh.borrow_mut() = snapshot;
                                 break Some(*on_crash);
                             }

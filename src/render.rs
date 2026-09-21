@@ -185,7 +185,7 @@ pub fn display(interp: &mut Interp, v: &Value, color: bool) -> Result<String, Cr
 }
 
 fn display_id(interp: &Interp, id: &str, pal: &Palette) -> String {
-    let p = interp.backend.unique_prefix(id);
+    let p = interp.unique_prefix(id);
     let n = p.len();
     format!("{}{}", pal.bold(p.as_str()), pal.dim(&id[n..]))
 }
@@ -712,16 +712,24 @@ fn display_list_block(
     }
     // list of Id: commit table (one commit line per id, in list order)
     if xs.iter().all(|x| matches!(x, Value::Id(_))) {
+        // index the history once: a `by_id` walk per id made printing a
+        // revset quadratic in the size of the history
+        let repo = top_of(interp, &xs[0])?;
+        let mut commits: BTreeMap<String, Value> = BTreeMap::new();
+        for c in crate::repo::all_commits(&repo)? {
+            if let Ok(Value::Id(i)) = c.field("id") {
+                commits.insert(i.to_string(), c);
+            }
+        }
         for x in xs {
             let id = match x {
                 Value::Id(i) => i.to_string(),
                 _ => unreachable!(),
             };
             out.push_str(&pad);
-            let repo = top_of(interp, x)?;
-            match crate::repo::by_id(&repo, &id)? {
-                Some(loc) => {
-                    let c = loc.field("root")?;
+            match commits.get(&id) {
+                Some(c) => {
+                    let c = c.clone();
                     let conflict = has_conflict(&c)?;
                     let glyph = if conflict {
                         pal.red("⊗")
@@ -737,7 +745,7 @@ fn display_list_block(
                         .map(|l| l.as_text().map(|s| s.to_string()))
                         .collect::<Result<_, _>>()?;
                     let id_s = if conflict {
-                        pal.red(&interp.backend.unique_prefix(&id))
+                        pal.red(&interp.unique_prefix(&id))
                     } else {
                         display_id(interp, &id, pal)
                     };
@@ -1263,16 +1271,14 @@ fn tree_render(
     // Step 3 — lanes
     let placements = assign_lanes(&rows, &trunk, lanes_n);
     // id column: shortest unique prefix among the display tree's commits, min 4
-    let ids: Vec<&str> = rows
+    // (sorted once, so each row costs a lookup rather than a scan of them all)
+    let mut ids: Vec<String> = rows
         .iter()
-        .filter_map(|n| n.commit().map(|c| c.id.as_str()))
+        .filter_map(|n| n.commit().map(|c| c.id.clone()))
         .collect();
+    ids.sort();
     let prefix_len = |id: &str| -> usize {
-        let mut n = 4.min(id.len());
-        while n < id.len() && ids.iter().any(|o| *o != id && o.starts_with(&id[..n])) {
-            n += 1;
-        }
-        n
+        crate::eval::unique_prefix_in(&ids, id).len()
     };
     // Step 4 — draw
     draw_rows(&rows, &placements, opts, pal, lanes_n, with_focus, &prefix_len)

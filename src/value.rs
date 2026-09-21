@@ -270,16 +270,11 @@ pub fn render_conflict(sides: &[Rc<Vec<u8>>]) -> Vec<u8> {
     let mut out = Vec::new();
     out.extend_from_slice(b"<<<<<<<\n");
     let mut i = 0;
-    let mut first_add = true;
     while i < sides.len() {
         if i % 2 == 0 {
-            if !first_add {
-                // another add after removes: separate
-            }
             out.extend_from_slice(b"+++++++\n");
             out.extend_from_slice(&sides[i]);
             ensure_newline(&mut out);
-            first_add = false;
         } else {
             out.extend_from_slice(b"%%%%%%%\n");
             out.extend_from_slice(&sides[i]);

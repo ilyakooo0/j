@@ -335,3 +335,46 @@ fn render_date_matches_utc_calendar() {
         assert_eq!(j::render::render_date(t), want, "t={}", t);
     }
 }
+
+#[test]
+fn unique_prefix_is_shortest_and_unambiguous() {
+    // computed from sorted neighbours rather than a scan of every id; the
+    // answers must match the definition: shortest prefix no other id shares,
+    // minimum four characters
+    let ids: Vec<String> = [
+        "kkkkllll", "kkkkmmmm", "kkkmnnnn", "lllloooo", "zzzzzzzz",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect();
+    let p = |id: &str| j::eval::unique_prefix_in(&ids, id);
+    // shares "kkkk" with kkkkmmmm, so needs five
+    assert_eq!(p("kkkkllll"), "kkkkl");
+    assert_eq!(p("kkkkmmmm"), "kkkkm");
+    // differs from the others by the fourth character: the minimum applies
+    assert_eq!(p("kkkmnnnn"), "kkkm");
+    assert_eq!(p("lllloooo"), "llll");
+    assert_eq!(p("zzzzzzzz"), "zzzz");
+    // an id not in the set is measured against the set all the same:
+    // "kkkkll" would still be a prefix of kkkkllll, so it needs seven
+    assert_eq!(p("kkkkllmm"), "kkkkllm");
+    // and every answer really is unique among the others
+    for id in &ids {
+        let pre = p(id);
+        assert!(pre.len() >= 4, "{} -> {}", id, pre);
+        let sharers = ids.iter().filter(|o| *o != id && o.starts_with(&pre)).count();
+        assert_eq!(sharers, 0, "{} -> {} is shared", id, pre);
+        // and it is the shortest such prefix
+        if pre.len() > 4 {
+            let shorter = &id[..pre.len() - 1];
+            assert!(
+                ids.iter().any(|o| o != id && o.starts_with(shorter)),
+                "{} -> {} is longer than needed",
+                id,
+                pre
+            );
+        }
+    }
+    // an empty set still respects the minimum
+    assert_eq!(j::eval::unique_prefix_in(&[], "kkkkllll"), "kkkk");
+}

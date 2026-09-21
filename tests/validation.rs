@@ -330,11 +330,26 @@ fn id_literals_in_config_resolve() {
         },
     );
     let i = Interp::new(Rc::new(b), cfg.shapes.clone(), Env::empty());
-    let failures = config::config_id_failures(&cfg, &i);
+    let mut resolved = config::load_config(&src).unwrap();
+    let failures = config::resolve_config_ids(&mut resolved, &i);
     assert!(failures.is_empty());
-    // unknown id fails
+    // resolving rewrites the definition: evaluating it must not hit the
+    // literal again (it used to crash with `internal: unresolved id literal`,
+    // and only when the definition was finally used)
+    let mut i3 = Interp::new(
+        Rc::new(MemBackend::new()),
+        resolved.shapes.clone(),
+        Env::empty(),
+    );
+    config::eval_config(&mut i3, &resolved).expect("resolved config evaluates");
+    match i3.globals.lookup("target") {
+        Some(Value::Id(id)) => assert_eq!(&*id, "kqqqqqqq"),
+        other => panic!("target is {:?}", other),
+    }
+    // unknown id fails, naming the definition
     let i2 = Interp::new(Rc::new(MemBackend::new()), cfg.shapes.clone(), Env::empty());
-    let failures = config::config_id_failures(&cfg, &i2);
+    let mut unresolved = config::load_config(&src).unwrap();
+    let failures = config::resolve_config_ids(&mut unresolved, &i2);
     assert_eq!(failures.len(), 1);
     assert_eq!(failures[0].0, "target");
 }

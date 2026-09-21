@@ -350,7 +350,7 @@ impl JjBackend {
 
     pub fn build_interp(
         &self,
-        cfg: &Config,
+        cfg: &mut Config,
         _text: &str,
         snapshot: bool,
     ) -> Result<(Interp, Value, Value), OpenError> {
@@ -392,6 +392,19 @@ impl JjBackend {
             cfg.shapes.clone(),
             crate::value::Env::empty(),
         );
+        // §1.2.5: resolve the config's `@prefix` literals now that the visible
+        // ids are known, and before anything evaluates a definition
+        if let Some((def, prefix, _)) =
+            crate::config::resolve_config_ids(cfg, &interp).into_iter().next()
+        {
+            return Err((
+                3,
+                format!(
+                    "config.j: `@{}` in `{}` does not resolve to a unique commit",
+                    prefix, def
+                ),
+            ));
+        }
         // §7.2: if the focused commit is in the immutable set, the snapshot
         // cannot go into it; the focus is a new empty child of it holding the
         // snapshot, and persisting records that child
@@ -648,12 +661,14 @@ impl JjBackend {
         written.insert(ROOT_ID.to_string(), root_jj.id().clone());
 
         // walk `new` top-down (§7.5 step 4), parents before children
-        let mut queue: Vec<(Value, String)> = Vec::new(); // (subtree value, parent change id)
+        // a deque, not a Vec: `remove(0)` shifts everything after it, which
+        // is quadratic in the number of commits for a wide history
+        let mut queue: std::collections::VecDeque<(Value, String)> =
+            std::collections::VecDeque::new(); // (subtree value, parent change id)
         for kid in top.field("children")?.as_list()?.iter() {
-            queue.push((kid.clone(), ROOT_ID.to_string()));
+            queue.push_back((kid.clone(), ROOT_ID.to_string()));
         }
-        while !queue.is_empty() {
-            let (subtree, parent_change) = queue.remove(0);
+        while let Some((subtree, parent_change)) = queue.pop_front() {
             let commit_v = subtree.field("root")?;
             let id = commit_id_of(&commit_v)?;
             let parent_jj = written
@@ -712,7 +727,7 @@ impl JjBackend {
             };
             written.insert(id.clone(), new_id);
             for kid in subtree.field("children")?.as_list()?.iter() {
-                queue.push((kid.clone(), id.clone()));
+                queue.push_back((kid.clone(), id.clone()));
             }
         }
 
@@ -909,7 +924,7 @@ impl JjBackend {
         let _ = block_on(self.publish_tx(tx, "fetch"))?;
         Ok(())
     }
-    pub fn cmd_push(&self, cfg: &Config, expr_text: &str) -> Result<(), OpenError> {
+    pub fn cmd_push(&self, cfg: &mut Config, expr_text: &str) -> Result<(), OpenError> {
         let origin = RemoteName::new("origin");
         let base = self.head_repo()?;
         let (value, vis) = self.eval_push_expr(cfg, expr_text, &base)?;
@@ -923,7 +938,7 @@ impl JjBackend {
     /// (§1.1), apply a function result to the repo value once (§7.6)
     fn eval_push_expr(
         &self,
-        cfg: &Config,
+        cfg: &mut Config,
         expr_text: &str,
         base: &Arc<ReadonlyRepo>,
     ) -> Result<(Value, Arc<VisibleRepo>), OpenError> {
