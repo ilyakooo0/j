@@ -268,3 +268,15 @@ fn apostrophes_in_identifiers() {
     assert_eq!(toks("x'"), vec![Tok::Ident("x'".into())]);
     assert_eq!(toks("x''y"), vec![Tok::Ident("x''y".into())]);
 }
+
+#[test]
+fn non_ascii_characters_are_a_clean_error() {
+    // unrecognised characters fell through to operator matching, which sliced
+    // the lookahead by byte — a panic on anything outside ASCII
+    for src in ["—", "λ", "é", "·", "→", "1 — 2", "x ≤ y", "🙂", "\u{a0}"] {
+        let m = err(src);
+        assert!(m.contains("unexpected"), "{:?} => {}", src, m);
+    }
+    // and they are still fine inside a text literal
+    assert_eq!(toks("\"— λ é 🙂\""), vec![Tok::Text("— λ é 🙂".into())]);
+}

@@ -787,7 +787,10 @@ fn display_list_block(
                     } else {
                         size
                     };
-                    out.push_str(&format!("{} {:width$}  {}\n", mark, path, size_s, width = width_max));
+                    // pad by display width, not by character count: `{:n$}`
+                    // pads to n *chars*, so a wide (East Asian) path pushes
+                    // the size column out of line
+                    out.push_str(&format!("{} {}  {}\n", mark, pad_right(&path, width_max), size_s));
                 }
                 return Ok(());
             }
@@ -2232,8 +2235,9 @@ fn color_rails(
     s
 }
 
-/// cut the message so labels and the margin keep their columns (§Step 4)
-fn truncate_lines(
+/// Cut the message so labels and the margin keep their columns (§Step 4).
+/// Only applied on a tty, so it is exercised directly by the tests.
+pub fn truncate_lines(
     lines: &mut [String],
     term_w: usize,
     msg_off: usize,
@@ -2250,17 +2254,14 @@ fn truncate_lines(
         if width(&plain) <= term_w {
             continue;
         }
-        // walk characters, tracking display column
+        // walk characters, tracking display column. Walk the *plain* string:
+        // skipping only the ESC character would leave the rest of each escape
+        // sequence (`[1;36m`) counted as display width.
         let mut col = 0usize;
         let mut cut_at: Option<usize> = None;
         let mut tail_start: Option<usize> = None;
         let mut prev_two_spaces = 0usize;
-        for (bi, ch) in line.char_indices() {
-            if ch == '\x1b' {
-                // skip escape sequence
-                continue;
-            }
-            let _ = bi;
+        for (bi, ch) in plain.char_indices() {
             let w = UnicodeWidthChar::width(ch).unwrap_or(0);
             if col >= msg_off {
                 if ch == ' ' {
@@ -2281,10 +2282,10 @@ fn truncate_lines(
             continue;
         }
         if let (Some(_cut), Some(_tail)) = (cut_at, tail_start) {
-            // recompute on the plain string, then rebuild: this path only
-            // matters on a tty, so keep it simple and operate on plain text
-            let p = strip_ansi(line);
-            let pw = width(&p);
+            // rebuild from the plain string: this path only matters on a tty,
+            // so keep it simple and operate on plain text
+            let p = &plain;
+            let pw = width(p);
             if pw <= term_w {
                 continue;
             }
@@ -2302,14 +2303,11 @@ fn truncate_lines(
             let tail = &p[tail_bi..];
             let tail_w = width(tail);
             let head_budget = term_w.saturating_sub(tail_w + 1);
-            let head = &p[..p
-                .char_indices()
-                .take_while(|(_, c)| {
-                    let _ = c;
-                    true
-                })
-                .count()
-                .min(p.len())];
+            // the whole plain line; the loop below stops it at head_budget.
+            // (This used to slice by `char_indices().count()`, a *char* count
+            // used as a *byte* index — a panic on any line whose multi-byte
+            // characters put that index inside a character.)
+            let head = p.as_str();
             let mut head_w = 0usize;
             let mut head_end = 0usize;
             for (bi, ch) in head.char_indices() {

@@ -315,3 +315,23 @@ fn color_respects_no_color() {
     assert!(j::render::color_enabled("always"));
     assert!(!j::render::color_enabled("never"));
 }
+
+#[test]
+fn render_date_matches_utc_calendar() {
+    // civil-from-days, no date crate: check epochs, leap days, century rules
+    for (t, want) in [
+        (0i64, "1970-01-01"),
+        (86_399, "1970-01-01"),
+        (86_400, "1970-01-02"),
+        (951_782_400, "2000-02-29"),   // leap year divisible by 400
+        (1_078_012_800, "2004-02-29"), // ordinary leap year
+        (4_107_542_400, "2100-03-01"), // 2100 is not a leap year
+        (1_700_000_000, "2023-11-14"),
+        (2_147_483_647, "2038-01-19"),
+        (-1, "1969-12-31"),            // before the epoch
+        (-86_400, "1969-12-31"),
+        (-86_401, "1969-12-30"),
+    ] {
+        assert_eq!(j::render::render_date(t), want, "t={}", t);
+    }
+}

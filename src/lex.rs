@@ -377,9 +377,10 @@ pub fn lex(src: &str) -> Result<Vec<SpTok>, LexError> {
             }
         }
         if matched.is_none() {
-            let one = &rest[..1];
+            // compare by character: `rest` is built from chars, so slicing it
+            // by byte would panic on any non-ASCII character reaching here
             for op in SYMBOLIC_OPS {
-                if op.len() == 1 && *op == one {
+                if op.len() == 1 && op.starts_with(c) {
                     matched = Some(op);
                     break;
                 }

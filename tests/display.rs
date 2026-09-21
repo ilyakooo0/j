@@ -279,3 +279,52 @@ fn conflicts_table() {
     assert!(out.contains("⊗"), "{}", out);
     assert!(out.contains("wip"), "{}", out);
 }
+
+#[test]
+fn entry_list_aligns_by_display_width() {
+    // the size column was padded with `{:n$}`, which counts characters; a
+    // wide (East Asian) path is two columns per character and pushed it out
+    let root = commit(ROOT_ID, "", &[], vec![]);
+    let focus = commit(
+        "kpqxaaaa",
+        "widths",
+        &[],
+        vec![
+            ("ascii-name.txt", "x\n"),
+            ("日本語.txt", "y\n"),
+            ("café.txt", "z\n"),
+        ],
+    );
+    let frame_root = Value::record(&[
+        ("left", Value::list(vec![])),
+        ("parent", root),
+        ("right", Value::list(vec![])),
+    ]);
+    let repo = Value::record(&[
+        ("children", Value::list(vec![])),
+        ("context", Value::list(vec![frame_root])),
+        ("root", focus),
+    ]);
+    let mut be = MemBackend::new();
+    for (id, m) in [
+        meta(ROOT_ID, "Root", 1_700_000_000),
+        meta("kpqxaaaa", "M", 1_700_000_100),
+    ] {
+        be.metas.insert(id, m);
+    }
+    let (mut i, cfg) = make_interp(be);
+    let out = eval_and_display(&mut i, &cfg, "files", repo);
+    // every size cell must begin at the same display column
+    let starts: Vec<usize> = out
+        .lines()
+        .filter(|l| l.ends_with(" B"))
+        .map(|l| j::render::width(&l[..l.rfind("  ").unwrap()]))
+        .collect();
+    assert_eq!(starts.len(), 3, "{}", out);
+    assert!(
+        starts.windows(2).all(|w| w[0] == w[1]),
+        "size column not aligned: {:?}\n{}",
+        starts,
+        out
+    );
+}

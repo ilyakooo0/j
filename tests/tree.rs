@@ -678,3 +678,69 @@ fn tree_worked_example() {
 
 
 
+
+// ----------------------------------------------------------------------
+// terminal-width truncation (§Step 4). Only runs on a tty in the binary,
+// so it is driven directly here.
+// ----------------------------------------------------------------------
+
+fn truncate_one(line: &str, term_w: usize) -> String {
+    let mut lines = vec![line.to_string()];
+    // msg_off 18 matches the rendered layout: rails, glyph and id column
+    j::render::truncate_lines(&mut lines, term_w, 18, true, true);
+    lines.pop().unwrap()
+}
+
+#[test]
+fn truncation_handles_multibyte_messages() {
+    // the head was sliced with a *char* count used as a *byte* index, which
+    // panics whenever that index lands inside a multi-byte character
+    let tail = "  label";
+    for n in 1..80 {
+        for w in [20usize, 30, 40, 50, 60, 80] {
+            let msg: String = "ω".repeat(n);
+            let line = format!("  ●        @abcd  {}{}", msg, tail);
+            let got = truncate_one(&line, w);
+            assert!(
+                j::render::width(&got) <= w.max(j::render::width(tail) + 2),
+                "n={} w={} -> {:?} ({} cols)",
+                n,
+                w,
+                got,
+                j::render::width(&got)
+            );
+        }
+    }
+}
+
+#[test]
+fn truncation_keeps_the_tail_and_fits() {
+    let line = format!("  ●        @abcd  {}  bookmark", "message ".repeat(20));
+    let got = truncate_one(&line, 60);
+    assert!(got.contains('…'), "no ellipsis: {:?}", got);
+    assert!(got.ends_with("bookmark"), "tail lost: {:?}", got);
+    assert!(j::render::width(&got) <= 60, "{} cols: {:?}", j::render::width(&got), got);
+}
+
+#[test]
+fn truncation_leaves_short_lines_alone() {
+    let line = "  ●        @abcd  short  label";
+    assert_eq!(truncate_one(line, 100), line);
+}
+
+#[test]
+fn truncation_survives_mixed_scripts() {
+    // wide (CJK), combining and ASCII in one message
+    for msg in [
+        "日本語のテキストがとても長い場合の折り返し処理",
+        "réfactorisation très importante — étape finale ✓",
+        "αβγδε ωωωωω ✓✓✓ ascii tail here",
+        "a̐éö̲ combining marks",
+    ] {
+        for w in [10usize, 25, 45, 70] {
+            let line = format!("  ●        @abcd  {}  lbl", msg);
+            let got = truncate_one(&line, w);
+            assert!(!got.is_empty(), "msg={:?} w={}", msg, w);
+        }
+    }
+}
