@@ -8,19 +8,32 @@ use std::collections::{BTreeSet, HashMap};
 pub struct Shapes {
     /// name -> its declared type
     pub decls: HashMap<String, TypeExpr>,
+    /// Memo for `shape_of`. A contract check against a record type asks for
+    /// the shape on every call, and computing it builds the field set afresh;
+    /// the declarations never change once the config is loaded.
+    memo: std::cell::RefCell<HashMap<String, Option<ShapeVal>>>,
 }
 
 impl Shapes {
     pub fn new() -> Shapes {
-        Shapes {
-            decls: HashMap::new(),
-        }
+        Shapes::default()
     }
 
     /// Compute the ShapeVal for a type name used as a value (§4.12).
     /// Returns None if the name is undeclared, or its shape is a function,
     /// a list, or otherwise not usable.
     pub fn shape_of(&self, name: &str) -> Option<ShapeVal> {
+        if let Some(hit) = self.memo.borrow().get(name) {
+            return hit.clone();
+        }
+        let computed = self.shape_of_uncached(name);
+        self.memo
+            .borrow_mut()
+            .insert(name.to_string(), computed.clone());
+        computed
+    }
+
+    fn shape_of_uncached(&self, name: &str) -> Option<ShapeVal> {
         match name {
             "Int" => Some(ShapeVal {
                 name: name.into(),
@@ -71,6 +84,27 @@ impl Shapes {
             )),
             TypeExpr::List(_) | TypeExpr::Fun(_, _) => None,
         }
+    }
+
+    /// Unfold an alias chain by reference. Contracts are checked at every
+    /// call, so cloning the type each time — a `Vec` of `String`s for a record
+    /// type — was a per-application allocation.
+    pub fn unfold<'a>(&'a self, ty: &'a TypeExpr) -> &'a TypeExpr {
+        let mut cur = ty;
+        // a declaration cycle would otherwise spin here; the bound is far
+        // above any real alias chain
+        for _ in 0..64 {
+            match cur {
+                TypeExpr::Con(n) if !is_primitive(n) && !is_type_var(n) => {
+                    match self.decls.get(n) {
+                        Some(decl) => cur = decl,
+                        None => return cur,
+                    }
+                }
+                _ => return cur,
+            }
+        }
+        cur
     }
 
     /// Unfold an alias chain, owned, so it works with partially-populated
@@ -136,8 +170,7 @@ pub fn compile_contract(shapes: &Shapes, ty: &TypeExpr) -> Contract {
 
 /// Check one level deep (§4.13). On failure, describe expected and got.
 pub fn check(shapes: &Shapes, ty: &TypeExpr, v: &Value) -> Result<(), String> {
-    let owned = shapes.unfold_owned(ty);
-    let ty = &owned;
+    let ty = shapes.unfold(ty);
     match ty {
         TypeExpr::Con(n) => {
             if is_type_var(n) {
@@ -338,7 +371,7 @@ impl ContractExpr {
     /// True if the next parameter is definitely a function type.
     pub fn next_param_is_function(&self, shapes: &Shapes) -> bool {
         match self.next_param() {
-            Some(t) => matches!(shapes.unfold_owned(&t), TypeExpr::Fun(_, _)),
+            Some(t) => matches!(shapes.unfold(&t), TypeExpr::Fun(_, _)),
             None => false,
         }
     }

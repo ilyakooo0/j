@@ -7,21 +7,72 @@ use crate::value::{value_eq, Crash, Value};
 use std::collections::{BTreeMap, BTreeSet};
 
 /// navigate: refocus `repo` on the commit with change id `id` (§10 reference).
+///
+/// Finding the commit and refocusing onto it are separate walks: refocusing
+/// builds a new location — a record, with the siblings split around a hole —
+/// so doing it for every node visited on the way cost an allocation per
+/// commit. Only the commits on the path to the target need one, and there are
+/// as many of those as the history is deep.
 pub fn by_id(repo: &Value, id: &str) -> Result<Option<Value>, Crash> {
     let top = top_of(repo)?;
-    let mut stack = vec![top];
-    while let Some(loc) = stack.pop() {
-        let root_id = id_of(&loc.field("root")?)?;
-        if root_id == id {
-            return Ok(Some(loc));
-        }
-        let children = loc.field("children").and_then(|v| v.as_list().map(|x| x.to_vec()))?;
-        // push children as refocused locations; iterate in order
-        for child in children.iter() {
-            stack.push(refocus_child(&loc, child)?);
-        }
+    if id_is(&top.field("root")?, id)? {
+        return Ok(Some(top));
     }
-    Ok(None)
+    let mut path = Vec::new();
+    let children = top.field("children")?;
+    if !find_path(children.as_list()?, id, &mut path)? {
+        return Ok(None);
+    }
+    // Descend the path collecting one frame per level and assemble the
+    // location once. Refocusing step by step would rebuild the context at
+    // every level, which is quadratic in the depth on its own.
+    let mut root = top.field("root")?;
+    let mut children = top.field("children")?;
+    let mut frames: Vec<Value> = Vec::with_capacity(path.len());
+    for idx in path {
+        let kids = children.as_list()?;
+        let child = kids[idx].clone();
+        frames.push(Value::record(&[
+            ("left", Value::list(kids[..idx].to_vec())),
+            ("parent", root),
+            ("right", Value::list(kids[idx + 1..].to_vec())),
+        ]));
+        root = child.field("root")?;
+        children = child.field("children")?;
+    }
+    // innermost frame first: `up` reads context.first() as the parent
+    frames.reverse();
+    // `top_of` leaves no context above, but do not depend on that here
+    frames.extend_from_slice(top.field("context")?.as_list()?);
+    Ok(Some(Value::record(&[
+        ("children", children),
+        ("context", Value::list(frames)),
+        ("root", root),
+    ])))
+}
+
+/// indices of the children to descend through to reach `id`, if it is there
+fn find_path(children: &[Value], id: &str, path: &mut Vec<usize>) -> Result<bool, Crash> {
+    for (i, c) in children.iter().enumerate() {
+        path.push(i);
+        if id_is(&c.field("root")?, id)? {
+            return Ok(true);
+        }
+        let grandchildren = c.field("children")?;
+        if find_path(grandchildren.as_list()?, id, path)? {
+            return Ok(true);
+        }
+        path.pop();
+    }
+    Ok(false)
+}
+
+/// compare a commit's id without copying it out
+fn id_is(commit: &Value, id: &str) -> Result<bool, Crash> {
+    match commit.field("id")? {
+        Value::Id(i) => Ok(i.as_str() == id),
+        v => Err(Crash::new(format!("expected an Id, got a {}", v.kind_name()))),
+    }
 }
 
 fn id_of(commit: &Value) -> Result<String, Crash> {
@@ -35,8 +86,10 @@ fn id_of(commit: &Value) -> Result<String, Crash> {
 fn top_of(repo: &Value) -> Result<Value, Crash> {
     let mut cur = repo.clone();
     loop {
-        let ctx = cur.field("context").and_then(|v| v.as_list().map(|x| x.to_vec()))?;
-        if ctx.is_empty() {
+        // ask whether the context is empty without copying it: this runs once
+        // per level, and copying made climbing quadratic in the depth
+        let ctx = cur.field("context")?;
+        if ctx.as_list()?.is_empty() {
             return Ok(cur);
         }
         cur = up_of(&cur)?;
@@ -60,9 +113,14 @@ fn up_of(repo: &Value) -> Result<Value, Crash> {
         ("children", repo.field("children")?),
     ]));
     children.extend_from_slice(right);
+    // the remaining context shares the frames rather than copying them
+    let rest = match repo.field("context")? {
+        Value::List(xs) => Value::List(xs.skip(1)),
+        v => return Err(Crash::new(format!("expected a list, got a {}", v.kind_name()))),
+    };
     Ok(Value::record(&[
         ("children", Value::list(children)),
-        ("context", Value::list(ctx[1..].to_vec())),
+        ("context", rest),
         ("root", parent),
     ]))
 }

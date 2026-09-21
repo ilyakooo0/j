@@ -499,6 +499,36 @@ proptest! {
     }
 
     #[test]
+    fn law_by_rebuilds_the_same_zipper((tree, focus, backend) in arb_repo()) {
+        // `by` finds the commit first and then assembles the location in one
+        // pass, instead of refocusing at every node it visits. The location it
+        // produces must be the one a step-by-step walk produced: same focus,
+        // same children, and a context that still climbs back to the top.
+        let repo = repo_value(&tree, &focus);
+        let stored: BTreeSet<String> = backend.metas.keys().cloned().collect();
+        let (mut i, cfg) = make_interp(backend);
+        for id in &stored {
+            let got = j::repo::by_id(&repo, id).unwrap();
+            prop_assert!(got.is_some(), "by {} found nothing", id);
+            let got = got.unwrap();
+            // the focus is the commit asked for
+            match got.field("root").unwrap().field("id").unwrap() {
+                Value::Id(f) => prop_assert_eq!(&*f, id),
+                _ => prop_assert!(false, "focus has no id"),
+            }
+            // `goto` through the language agrees with it
+            let viaz = eval_fn(&mut i, &cfg, &format!("by @{}", id), repo.clone());
+            prop_assert!(viaz.is_ok(), "by @{} failed: {:?}", id, viaz.err());
+            prop_assert!(repos_match(&viaz.unwrap(), &got, &stored));
+            // climbing all the way up returns the whole history unchanged
+            let up = eval_fn(&mut i, &cfg, "top", got.clone());
+            prop_assert!(up.is_ok(), "top failed: {:?}", up.err());
+            let from_repo = eval_fn(&mut i, &cfg, "top", repo.clone()).unwrap();
+            prop_assert!(repos_match(&up.unwrap(), &from_repo, &stored));
+        }
+    }
+
+    #[test]
     fn law_top_top((tree, focus, backend) in arb_repo()) {
         let repo = repo_value(&tree, &focus);
         let stored: BTreeSet<String> = backend.metas.keys().cloned().collect();
@@ -520,5 +550,95 @@ proptest! {
         let a = eval_fn(&mut i, &cfg, "concat ([[1] [2]] ++ [[3]])", Value::Bool(true)).unwrap();
         let b = eval_fn(&mut i, &cfg, "concat [[1] [2]] ++ concat [[3]]", Value::Bool(true)).unwrap();
         prop_assert!(value_eq(&a, &b).unwrap());
+    }
+}
+
+/// A linear repo root -> c0 -> c1 -> ... focused on the top, built directly.
+fn linear_repo(n: usize) -> (Value, Vec<String>) {
+    let ids: Vec<String> = (0..n).map(|k| format!("kaaa{:04}", k)).collect();
+    let mut subtree = Value::record(&[
+        ("children", Value::list(vec![])),
+        (
+            "root",
+            Value::record(&[
+                ("files", Value::list(vec![])),
+                ("id", Value::Id(Rc::new(ids[n - 1].clone()))),
+                ("labels", Value::list(vec![])),
+                ("message", Value::text(format!("commit {}", n - 1))),
+            ]),
+        ),
+    ]);
+    for k in (0..n - 1).rev() {
+        subtree = Value::record(&[
+            ("children", Value::list(vec![subtree])),
+            (
+                "root",
+                Value::record(&[
+                    ("files", Value::list(vec![])),
+                    ("id", Value::Id(Rc::new(ids[k].clone()))),
+                    ("labels", Value::list(vec![])),
+                    ("message", Value::text(format!("commit {}", k))),
+                ]),
+            ),
+        ]);
+    }
+    let repo = Value::record(&[
+        ("children", Value::list(vec![subtree])),
+        ("context", Value::list(vec![])),
+        (
+            "root",
+            Value::record(&[
+                ("files", Value::list(vec![])),
+                ("id", Value::Id(Rc::new(ROOT_ID.to_string()))),
+                ("labels", Value::list(vec![])),
+                ("message", Value::text("")),
+            ]),
+        ),
+    ]);
+    (repo, ids)
+}
+
+#[test]
+fn by_builds_the_context_innermost_first() {
+    // `by` assembles the location in one pass now; the context must still run
+    // from the immediate parent outwards, which is what `up` reads
+    let (repo, ids) = linear_repo(8);
+    for (depth, id) in ids.iter().enumerate() {
+        let loc = j::repo::by_id(&repo, id).unwrap().expect("found");
+        match loc.field("root").unwrap().field("id").unwrap() {
+            Value::Id(f) => assert_eq!(&*f, id, "wrong focus"),
+            _ => panic!("focus has no id"),
+        }
+        let ctx = loc.field("context").unwrap();
+        let ctx = ctx.as_list().unwrap();
+        assert_eq!(ctx.len(), depth + 1, "context depth for {}", id);
+        // frame k names the ancestor k+1 levels up; the last is the root
+        for (k, frame) in ctx.iter().enumerate() {
+            let want = if depth >= k + 1 {
+                ids[depth - k - 1].clone()
+            } else {
+                ROOT_ID.to_string()
+            };
+            match frame.field("parent").unwrap().field("id").unwrap() {
+                Value::Id(p) => assert_eq!(&*p, &want, "frame {} of {}", k, id),
+                _ => panic!("frame parent has no id"),
+            }
+        }
+    }
+}
+
+#[test]
+fn by_then_climbing_back_restores_the_history() {
+    let (repo, ids) = linear_repo(8);
+    let (mut i, cfg) = make_interp(MemBackend::new());
+    let whole = eval_fn(&mut i, &cfg, "top", repo.clone()).unwrap();
+    for id in &ids {
+        let loc = j::repo::by_id(&repo, id).unwrap().expect("found");
+        let back = eval_fn(&mut i, &cfg, "top", loc).unwrap();
+        assert!(
+            value_eq(&back, &whole).unwrap_or(false),
+            "climbing back from {} changed the history",
+            id
+        );
     }
 }
