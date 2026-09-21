@@ -1084,8 +1084,18 @@ fn build_info(
             }
         }
         None => {
-            let n = nfiles;
-            (n == 0 && id != ROOT_ID, None, Vec::new())
+            // No parent snapshot to compare against — either this is the top
+            // of the history, or the parent's file list was never materialized
+            // because nothing needed it. `nfiles` is 0 in that second case
+            // simply because the list was not loaded, so it cannot stand in
+            // for emptiness: ask the backend first, and fall back to the file
+            // count only when the list really was loaded (which is exactly
+            // when the backend could not answer).
+            let empty = match backend_empty {
+                Some(e) => e && id != ROOT_ID,
+                None => nfiles == 0 && id != ROOT_ID,
+            };
+            (empty, None, Vec::new())
         }
     };
     let meta = interp.backend.meta(&id).ok();

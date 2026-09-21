@@ -483,3 +483,125 @@ fn missing_config_is_created_editable() {
     }
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+// ----------------------------------------------------------------------
+// regressions
+// ----------------------------------------------------------------------
+
+#[test]
+fn read_only_run_does_not_hide_working_copy_changes() {
+    // A printing run snapshots the working directory but records no
+    // operation. It must not save the scanned tree state either: doing so
+    // told the next run's incremental snapshot that the directory was already
+    // recorded, so it rebuilt the Repo from the stale tree in the working-copy
+    // commit — and a later persisting run then checked that stale tree back
+    // out, discarding the edits from disk (§7.4/§7.7).
+    let r = setup();
+    r.write("a.txt", "one\n");
+    r.j(&["id"]).ok();
+    r.write("a.txt", "edited content\n");
+    r.write("b.txt", "brand new\n");
+    for _ in 0..3 {
+        let out = r.j(&["files"]).ok().stdout;
+        assert!(out.contains("a.txt"), "{}", out);
+        assert!(out.contains("b.txt"), "b.txt missing from: {}", out);
+    }
+    // and the edits survive the next persisting run, on disk and in the commit
+    r.j(&["describe \"after reads\""]).ok();
+    assert_eq!(r.read("a.txt"), "edited content\n");
+    assert_eq!(r.read("b.txt"), "brand new\n");
+    let files = r.j(&["files"]).ok().stdout;
+    assert!(files.contains("b.txt"), "{}", files);
+}
+
+#[test]
+fn refused_reserved_command_does_not_hide_working_copy_changes() {
+    // `undo` refuses a dirty working copy; the snapshot it took to decide
+    // that must not be saved either, for the same reason
+    let r = setup();
+    r.write("a.txt", "one\n");
+    r.j(&["id"]).ok();
+    r.write("a.txt", "edited content\n");
+    assert_eq!(r.j(&["undo"]).code, 1);
+    let out = r.j(&["files"]).ok().stdout;
+    assert!(out.contains("a.txt"), "{}", out);
+    // the size column reflects the edited file, not the recorded one
+    assert!(out.contains("15 B"), "expected the edited size in: {}", out);
+}
+
+#[test]
+fn tree_does_not_mark_commits_empty() {
+    // `empty` was read off a file count that is 0 whenever the parent's file
+    // list was never materialized, so every commit whose parent skipped
+    // loading files rendered with the empty glyph
+    let r = setup();
+    for n in ["a", "b", "c", "d"] {
+        r.write(&format!("{}.txt", n), &format!("content {}\n", n));
+        r.j(&[&format!("describe \"commit {}\"", n)]).ok();
+        r.j(&["new"]).ok();
+    }
+    let out = r.j(&["tree"]).ok().stdout;
+    // each commit that added a file must not carry the empty glyph (the
+    // legend at the bottom names it too, so check the commit rows only)
+    for n in ["a", "b", "c", "d"] {
+        let row = out
+            .lines()
+            .find(|l| l.contains(&format!("commit {}", n)))
+            .unwrap_or_else(|| panic!("no row for commit {} in:\n{}", n, out));
+        assert!(!row.contains('◌'), "commit {} marked empty: {:?}", n, row);
+    }
+}
+
+#[test]
+fn redo_twice_in_a_row() {
+    // the second redo followed the redo marker to the undo it reversed and
+    // restored *that* view, instead of looking outward for an undo that had
+    // not been reversed yet (§7.7)
+    let r = setup();
+    r.write("a.txt", "x\n");
+    // two operations on the same commit, so undoing both clears the message
+    r.j(&["describe \"one\""]).ok();
+    r.j(&["describe \"two\""]).ok();
+    r.j(&["undo"]).ok();
+    assert!(r.j(&["status"]).ok().stdout.contains("one"));
+    r.j(&["undo"]).ok();
+    let cleared = r.j(&["status"]).ok().stdout;
+    assert!(!cleared.contains("one"), "{}", cleared);
+    r.j(&["redo"]).ok();
+    let first = r.j(&["status"]).ok().stdout;
+    assert!(first.contains("one"), "first redo: {}", first);
+    r.j(&["redo"]).ok();
+    let second = r.j(&["status"]).ok().stdout;
+    assert!(second.contains("two"), "second redo did not restore it:\n{}", second);
+}
+
+#[test]
+fn undo_redo_cycles_are_stable() {
+    // alternating undo/redo must keep returning to the same two states
+    let r = setup();
+    r.write("a.txt", "x\n");
+    r.j(&["describe \"one\""]).ok();
+    for i in 0..3 {
+        r.j(&["undo"]).ok();
+        let after = r.j(&["status"]).ok().stdout;
+        assert!(!after.contains("one"), "cycle {}: {}", i, after);
+        r.j(&["redo"]).ok();
+        let back = r.j(&["status"]).ok().stdout;
+        assert!(back.contains("one"), "cycle {}: {}", i, back);
+    }
+}
+
+#[test]
+fn extract_sees_through_lazy_file_lists() {
+    // a commit's `files` is a thunk until something asks for it; `extract`
+    // walked past it, so it found no entries at all on a real repository
+    // while finding them all on the in-memory backend
+    let r = setup();
+    r.write("a.txt", "x\n");
+    r.write("b.txt", "y\n");
+    r.j(&["id"]).ok();
+    let entries = r.j(&["length . extract Entry"]).ok().stdout;
+    assert_eq!(entries.trim(), "2", "extract Entry: {}", entries);
+    let blobs = r.j(&["length . extract Blob"]).ok().stdout;
+    assert_eq!(blobs.trim(), "2", "extract Blob: {}", blobs);
+}

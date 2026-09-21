@@ -531,12 +531,15 @@ impl JjBackend {
             .map_err(|e| (2, format!("cannot write the snapshot operation: {}", e)))?;
         let op_id = unpublished.operation().id().clone();
         let new_repo = unpublished.leave_unpublished();
-        // the working-copy state tracks the snapshot tree, against the
-        // current (published) head; persist will finish against its own op
-        locked_ws
-            .finish(self.current_repo().operation().id().clone())
-            .await
-            .map_err(|e| (2, format!("cannot finish the snapshot: {}", e)))?;
+        // Release the lock *without* finishing: `finish` saves the scanned
+        // tree state to disk, which would record the working directory as
+        // already snapshotted while the published head still has the old wc
+        // tree. The next run's incremental snapshot would then find nothing
+        // to do and build the Repo from the stale tree — and a persisting run
+        // would check that stale tree back out, destroying the edits. The
+        // state is advanced only by `persist`'s checkout, which finishes
+        // against the operation that actually recorded the tree (§7.4/§7.7).
+        drop(locked_ws);
         let _ = op_id;
         let pending = PendingSnapshot {
             pre_repo: self.current_repo(),
@@ -1049,7 +1052,12 @@ impl JjBackend {
                     break;
                 }
                 (Some(m), false) => {
-                    // a redo: move past the undo it reversed
+                    // a redo: "move past the operation it reapplied" (§7.7).
+                    // The redo marker names the *undo* it reversed; the
+                    // operation that undo discarded is the one this redo put
+                    // back, so that is where the walk continues. Stopping at
+                    // the undo instead would make the loop treat it as an undo
+                    // to follow and step back one operation too far.
                     if !m.authored_by_j {
                         let Some(parent) = cur.parent_ids().first().cloned() else {
                             return Err((1, "nothing to undo".to_string()));
@@ -1057,18 +1065,31 @@ impl JjBackend {
                         target_op_id = parent;
                         break;
                     }
-                    cur = block_on(loader.load_operation(&m.id))
+                    let undo_op = block_on(loader.load_operation(&m.id))
                         .map_err(|e| (2, format!("cannot load an operation: {}", e)))?;
+                    cur = match op_marker(undo_op.metadata()) {
+                        Some(u) if u.kind == "undo" && u.authored_by_j => {
+                            block_on(loader.load_operation(&u.id))
+                                .map_err(|e| (2, format!("cannot load an operation: {}", e)))?
+                        }
+                        // cannot follow the marker: degrade to the undo itself
+                        _ => undo_op,
+                    };
                 }
                 (Some(m), true) => {
-                    // a redo: reverse the undo it reversed, following further
-                    // redos to the operation ultimately reapplied
-                    target_op_id = if m.authored_by_j {
-                        block_on(chain_through_redos(&loader, &m.id))?
-                    } else {
-                        m.id
+                    // a redo: the undo it reversed is already accounted for,
+                    // so keep looking outward from that undo's parent for an
+                    // undo that has not been reversed yet (§7.7: the head must
+                    // be an undo, "possibly reached through redos").
+                    if !m.authored_by_j {
+                        target_op_id = m.id;
+                        break;
+                    }
+                    let Some(prev) = op_parent_id(&loader, &m.id)? else {
+                        return Err((1, "nothing to redo".to_string()));
                     };
-                    break;
+                    cur = block_on(loader.load_operation(&prev))
+                        .map_err(|e| (2, format!("cannot load an operation: {}", e)))?;
                 }
             }
         }
@@ -1136,9 +1157,18 @@ impl JjBackend {
         let (new_tree, _stats) = block_on(locked_ws.locked_wc().snapshot(&options))
             .map_err(|e| (2, format!("cannot read the working copy: {}", e)))?;
         let same = new_tree.tree_ids() == wc_commit.tree().tree_ids();
-        // discard: finish against the current op so no state changes
-        block_on(locked_ws.finish(base.operation().id().clone()))
-            .map_err(|e| (2, format!("cannot finish: {}", e)))?;
+        if same {
+            // the scanned tree is the one already recorded: saving the state
+            // only refreshes the mtime cache
+            block_on(locked_ws.finish(base.operation().id().clone()))
+                .map_err(|e| (2, format!("cannot finish: {}", e)))?;
+        } else {
+            // the working copy differs from @ and this command records
+            // nothing: drop the lock without saving, or the state would claim
+            // the directory was snapshotted and hide the changes from the next
+            // run (§7.7)
+            drop(locked_ws);
+        }
         drop(ws_guard);
         if !same {
             return Err(dirty);
@@ -1460,7 +1490,7 @@ enum OpKind {
     /// the operation this undo discarded the view of
     Undo { #[allow(dead_code)] undid: OperationId },
     /// the undo this redo reversed
-    Redo { redid: OperationId },
+    Redo { #[allow(dead_code)] redid: OperationId },
 }
 
 /// a marker parsed from an operation description (§7.7 kinds)
@@ -1524,24 +1554,6 @@ fn op_parent_id(
     let op = block_on(loader.load_operation(op_id))
         .map_err(|e| (2, format!("cannot load an operation: {}", e)))?;
     Ok(op.parent_ids().first().cloned())
-}
-
-/// follow a chain of redos to the operation that was ultimately reapplied
-async fn chain_through_redos(
-    loader: &jj_lib::repo::RepoLoader,
-    first: &OperationId,
-) -> Result<OperationId, OpenError> {
-    let mut id = first.clone();
-    loop {
-        let op = loader
-            .load_operation(&id)
-            .await
-            .map_err(|e| (2, format!("cannot load an operation: {}", e)))?;
-        match op_kind(op.metadata()) {
-            OpKind::Redo { redid } => id = redid,
-            _ => return Ok(id),
-        }
-    }
 }
 
 /// parse the push-record list (§7.6): records of shape {id, name} set a

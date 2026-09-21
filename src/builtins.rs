@@ -215,16 +215,26 @@ fn b_ne(_i: &mut Interp, args: &[Value]) -> BResult {
     Ok(Value::Bool(!value_eq(&args[0], &args[1])?))
 }
 
+// `&&` and `||` short-circuit when written infix (the evaluator handles
+// `Expr::BinOp` directly). These are the same operators used as *values* —
+// `foldl (&&) true xs`, `map ((||) b) xs` — where both arguments are already
+// evaluated, so they must still combine them rather than return the second.
 fn b_and(_i: &mut Interp, args: &[Value]) -> BResult {
     want!(args, 0, Value::Bool(_), "Bool");
     want!(args, 1, Value::Bool(_), "Bool");
-    Ok(args[1].clone())
+    match (&args[0], &args[1]) {
+        (Value::Bool(a), Value::Bool(b)) => Ok(Value::Bool(*a && *b)),
+        _ => unreachable!("checked above"),
+    }
 }
 
 fn b_or(_i: &mut Interp, args: &[Value]) -> BResult {
     want!(args, 0, Value::Bool(_), "Bool");
     want!(args, 1, Value::Bool(_), "Bool");
-    Ok(args[1].clone())
+    match (&args[0], &args[1]) {
+        (Value::Bool(a), Value::Bool(b)) => Ok(Value::Bool(*a || *b)),
+        _ => unreachable!("checked above"),
+    }
 }
 
 fn b_not(_i: &mut Interp, args: &[Value]) -> BResult {
@@ -651,6 +661,12 @@ fn extract_into(
     out: &mut Vec<Value>,
 ) -> Result<(), Crash> {
     use crate::value::{PrimKind, ShapeKind};
+    // a commit's `files` is a thunk until something asks for it; the language
+    // must not see the difference, so force before matching and recursing —
+    // otherwise `extract Entry repo` finds nothing on a real repository while
+    // finding everything on the in-memory backend
+    let forced = v.forced()?;
+    let v = &forced;
     let matches = match (&shape.kind, v) {
         (ShapeKind::Prim(PrimKind::Int), Value::Int(_)) => true,
         (ShapeKind::Prim(PrimKind::Text), Value::Text(_)) => true,

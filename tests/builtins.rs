@@ -281,3 +281,24 @@ labelled = \_ _ -> []
         Err(c) => assert!(c.msg.contains("unbound"), "{}", c.msg),
     }
 }
+
+#[test]
+fn boolean_operators_as_values() {
+    // `&&` and `||` short-circuit as infix operators, which the evaluator
+    // handles directly. Used as values — a section, or passed to foldl/map —
+    // both arguments are already evaluated, and the builtin must still
+    // combine them rather than return the second one.
+    let (mut i, cfg) = make_interp();
+    check!(i, cfg, "foldl (&&) true [true true]", Value::Bool(true));
+    check!(i, cfg, "foldl (&&) true [true false]", Value::Bool(false));
+    check!(i, cfg, "foldl (&&) true [false true]", Value::Bool(false));
+    check!(i, cfg, "foldl (||) false [false false]", Value::Bool(false));
+    check!(i, cfg, "foldl (||) false [false true]", Value::Bool(true));
+    check!(i, cfg, "foldl (||) false [true false]", Value::Bool(true));
+    // partially applied sections
+    check!(i, cfg, "map ((&&) false) [true true]", Value::list(vec![Value::Bool(false); 2]));
+    check!(i, cfg, "map ((||) true) [false false]", Value::list(vec![Value::Bool(true); 2]));
+    // infix still short-circuits: the rhs is never evaluated
+    check!(i, cfg, "false && (crash \"boom\")", Value::Bool(false));
+    check!(i, cfg, "true || (crash \"boom\")", Value::Bool(true));
+}
