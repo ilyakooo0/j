@@ -478,6 +478,27 @@ proptest! {
     }
 
     #[test]
+    fn law_cached_revset_matches_direct((tree, focus, backend) in arb_repo()) {
+        // `trunk` and `immutable` are memoised per Repo value, because the
+        // binary asks for each more than once per run and every evaluation
+        // walks the whole history. The cached answer must be the answer the
+        // config gives, and must not change on a second ask.
+        let repo = repo_value(&tree, &focus);
+        let (mut i, cfg) = make_interp(backend);
+        for name in ["trunk", "immutable"] {
+            let direct = eval_fn(&mut i, &cfg, name, repo.clone());
+            prop_assert!(direct.is_ok(), "{} failed: {:?}", name, direct.err());
+            let direct = direct.unwrap();
+            let first = i.apply_cached_revset(name, &repo);
+            prop_assert!(first.is_ok(), "cached {} failed", name);
+            let first = first.unwrap();
+            let second = i.apply_cached_revset(name, &repo).unwrap();
+            prop_assert!(value_eq(&direct, &first).unwrap_or(false), "{}: cached differs", name);
+            prop_assert!(value_eq(&first, &second).unwrap_or(false), "{}: second ask differs", name);
+        }
+    }
+
+    #[test]
     fn law_top_top((tree, focus, backend) in arb_repo()) {
         let repo = repo_value(&tree, &focus);
         let stored: BTreeSet<String> = backend.metas.keys().cloned().collect();

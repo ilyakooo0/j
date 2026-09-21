@@ -413,14 +413,13 @@ impl JjBackend {
         cfg: &Config,
         current: &Value,
     ) -> Result<Option<Value>, OpenError> {
-        // evaluate the config to compute the immutable set
-        let mut probe = Interp::new(
-            Rc::new(self.clone()),
-            cfg.shapes.clone(),
-            crate::value::Env::empty(),
-        );
-        crate::config::eval_config(&mut probe, cfg).map_err(|c| (3, c.msg))?;
-        let immutable = crate::repo::compute_immutable(&mut probe, current)
+        // Evaluate the config to compute the immutable set. This uses the
+        // interpreter the run will go on to use, rather than a throwaway one,
+        // so that the `immutable` (and the `trunk` inside it) computed here is
+        // reused when rendering or persisting asks for the same Repo value —
+        // each is a full interpreted walk of the history.
+        crate::config::eval_config(interp, cfg).map_err(|c| (3, c.msg))?;
+        let immutable = crate::repo::compute_immutable(interp, current)
             .map_err(|c| (1, c.msg))?;
         let focus_id = match current.field("root").and_then(|r| r.field("id")) {
             Ok(Value::Id(i)) => i.to_string(),
@@ -430,7 +429,6 @@ impl JjBackend {
             return Ok(None);
         }
         // build: new empty child of the focus with the focus's files, minted id
-        let _ = interp;
         let root = current.field("root").map_err(|c| (1, c.msg))?;
         let files = root.field("files").map_err(|c| (1, c.msg))?;
         let child = crate::value::Value::record(&[
@@ -439,7 +437,7 @@ impl JjBackend {
             ("labels", crate::value::Value::list(vec![])),
             (
                 "id",
-                crate::value::Value::Id(Rc::new(probe.mint_id())),
+                crate::value::Value::Id(Rc::new(interp.mint_id())),
             ),
         ]);
         let child_subtree = crate::value::Value::record(&[

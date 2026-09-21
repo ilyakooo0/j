@@ -335,37 +335,64 @@ fn path_string(p: &Value) -> Result<String, Crash> {
     Ok(parts.join("/"))
 }
 
+/// entries of one snapshot, keyed by path components
+type SnapMap = BTreeMap<Vec<String>, Value>;
+
 fn touched_paths(change: &Value) -> Result<Vec<(String, char, bool)>, Crash> {
-    // (path, mark, unresolved)
     let from = snapshot_map_of(&change.field("from")?)?;
     let to = snapshot_map_of(&change.field("to")?)?;
-    let mut paths: BTreeSet<Vec<String>> = BTreeSet::new();
-    paths.extend(from.keys().cloned());
-    paths.extend(to.keys().cloned());
+    Ok(touched_in_maps(&from, &to)?
+        .into_iter()
+        .map(|(p, mark, unresolved)| (p.join("/"), mark, unresolved))
+        .collect())
+}
+
+/// The changed paths between two snapshots that have already been keyed, as
+/// (path components, mark, unresolved). Both maps are sorted, so the union is
+/// a merge — the previous version collected every key of both sides into a
+/// `BTreeSet`, cloning each one.
+fn touched_in_maps(from: &SnapMap, to: &SnapMap) -> Result<Vec<(Vec<String>, char, bool)>, Crash> {
     let mut out = Vec::new();
-    for p in paths {
-        let f = from.get(&p);
-        let t = to.get(&p);
-        let mark = match (f, t) {
-            (None, Some(_)) => '+',
-            (Some(_), None) => '−',
-            (Some(a), Some(b)) => {
+    let mut fi = from.iter().peekable();
+    let mut ti = to.iter().peekable();
+    loop {
+        let ord = match (fi.peek(), ti.peek()) {
+            (None, None) => break,
+            (Some(_), None) => std::cmp::Ordering::Less,
+            (None, Some(_)) => std::cmp::Ordering::Greater,
+            (Some((fp, _)), Some((tp, _))) => fp.cmp(tp),
+        };
+        let (path, mark, t) = match ord {
+            std::cmp::Ordering::Less => {
+                let (p, _) = fi.next().unwrap();
+                (p, '−', None)
+            }
+            std::cmp::Ordering::Greater => {
+                let (p, v) = ti.next().unwrap();
+                (p, '+', Some(v))
+            }
+            std::cmp::Ordering::Equal => {
+                let (p, a) = fi.next().unwrap();
+                let (_, b) = ti.next().unwrap();
                 if crate::value::value_eq(a, b)? {
                     continue;
                 }
-                '~'
+                (p, '~', Some(b))
             }
-            (None, None) => continue,
         };
         let unresolved = t
             .map(|b| matches!(b, Value::Blob(bl) if bl.is_unresolved()))
             .unwrap_or(false);
-        out.push((p.join("/"), if unresolved { '✖' } else { mark }, unresolved));
+        out.push((
+            path.clone(),
+            if unresolved { '✖' } else { mark },
+            unresolved,
+        ));
     }
     Ok(out)
 }
 
-fn snapshot_map_of(snap: &Value) -> Result<BTreeMap<Vec<String>, Value>, Crash> {
+fn snapshot_map_of(snap: &Value) -> Result<SnapMap, Crash> {
     let mut m = BTreeMap::new();
     for e in snap.as_list()?.iter() {
         let path = e
@@ -998,6 +1025,24 @@ impl CommitInfo {
     }
 }
 
+/// A parent commit's snapshot as seen by its children: the files value, plus
+/// its path-keyed map built at most once and shared by every child's diff.
+/// Keying a snapshot allocates a `Vec<String>` per entry, so rebuilding it for
+/// each child dominated `treeFull`/`treeData` on a large history.
+struct ParentSnap<'a> {
+    files: &'a Value,
+    map: &'a std::cell::OnceCell<SnapMap>,
+}
+
+impl ParentSnap<'_> {
+    fn map(&self) -> Result<&SnapMap, Crash> {
+        if self.map.get().is_none() {
+            let _ = self.map.set(snapshot_map_of(self.files)?);
+        }
+        Ok(self.map.get().expect("just set"))
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn build_info(
     interp: &mut Interp,
@@ -1007,7 +1052,7 @@ fn build_info(
     immutable: &BTreeSet<String>,
     focus_id: &str,
     anc: &BTreeSet<String>,
-    parent_files: Option<&Value>,
+    parent_files: Option<&ParentSnap<'_>>,
     with_focus: bool,
     parent_is_ancestor: bool,
     parent_is_focus: bool,
@@ -1049,38 +1094,39 @@ fn build_info(
         None
     };
     let nfiles = files.as_ref().map(|f| f.as_list().map(|l| l.len())).transpose()?.unwrap_or(0);
+    // this commit's own snapshot map, built on first use and shared with every
+    // child that diffs against it
+    let my_map: std::cell::OnceCell<SnapMap> = std::cell::OnceCell::new();
+    let my_snap = files.as_ref().map(|f| ParentSnap {
+        files: f,
+        map: &my_map,
+    });
     let (empty, size, detail_marks) = match parent_files {
-        Some(pf) => {
+        Some(parent) => {
+            let pf = parent.files;
             let empty = match backend_empty {
                 Some(e) => e,
                 None => crate::value::value_eq(files.as_ref().expect("files loaded"), pf)?,
             };
             if want_diff {
-                let files = files.as_ref().expect("files loaded");
-                let change = Value::record(&[("from", pf.clone()), ("to", files.clone())]);
-                let marks = touched_paths(&change)?;
+                // both maps are built at most once per commit and reused by
+                // this commit's children, so a diff costs one keying, not four
+                let from_map = parent.map()?;
+                let to_map = my_snap.as_ref().expect("files loaded").map()?;
+                let marks = touched_in_maps(from_map, to_map)?;
                 // size: lines added+removed against the parent
-                let from_map = snapshot_map_of(pf)?;
-                let to_map = snapshot_map_of(files)?;
                 let mut lines = 0usize;
-                for (p, _, _) in &marks {
-                    let key: Vec<String> = p.split('/').map(|s| s.to_string()).collect();
-                    let count = |m: &BTreeMap<Vec<String>, Value>| -> usize {
-                        match m.get(&key) {
-                            Some(Value::Blob(b)) => {
-                                let n = b
-                                    .bytes()
-                                    .map(|v| String::from_utf8_lossy(&v).lines().count())
-                                    .unwrap_or(1);
-                                n.max(1)
-                            }
+                for (key, _, _) in &marks {
+                    let count = |m: &SnapMap| -> usize {
+                        match m.get(key) {
+                            Some(Value::Blob(b)) => b.line_count().max(1),
                             _ => 1,
                         }
                     };
-                    lines += count(&from_map) + count(&to_map);
+                    lines += count(from_map) + count(to_map);
                 }
                 let marks2: Vec<(String, char)> =
-                    marks.iter().map(|(p, m, _)| (p.clone(), *m)).collect();
+                    marks.iter().map(|(p, m, _)| (p.join("/"), *m)).collect();
                 (marks.is_empty(), Some(lines), marks2)
             } else {
                 (empty, None, Vec::new())
@@ -1114,7 +1160,7 @@ fn build_info(
             immutable,
             focus_id,
             anc,
-            files.as_ref(),
+            my_snap.as_ref(),
             with_focus,
             is_ancestor_of_focus,
             is_focus_pre,
@@ -1258,11 +1304,7 @@ fn top_id(repo: &Value) -> Result<String, Crash> {
 fn compute_trunk(interp: &mut Interp, repo: &Value) -> Result<BTreeSet<String>, Crash> {
     let mut set = BTreeSet::new();
     set.insert(top_id(repo)?);
-    let trunk_fn = interp
-        .globals
-        .lookup("trunk")
-        .ok_or_else(|| Crash::new("`trunk` is not defined"))?;
-    let v = interp.apply(trunk_fn, repo.clone())?;
+    let v = interp.apply_cached_revset("trunk", repo)?;
     let mut named: Vec<String> = Vec::new();
     for idv in v.as_list()?.iter() {
         match idv {

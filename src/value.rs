@@ -12,7 +12,7 @@ pub enum Value {
     Int(BigInt),
     Text(Rc<String>),
     Bool(bool),
-    List(Rc<Vec<Value>>),
+    List(ListVal),
     Record(Rc<RecordMap>),
     Fun(Rc<FunVal>),
     Id(Rc<String>),
@@ -22,6 +22,44 @@ pub enum Value {
     /// `files` list, so loading a repo does not materialize every commit's
     /// file list. Forced transparently by `Value::field` and `value_eq`.
     Thunk(Rc<ThunkVal>),
+}
+
+/// A list: shared elements plus the offset of its first one, so dropping a
+/// prefix (`tail`, `drop`) shares the storage instead of copying it. The
+/// zipper walks — `up` is `tail repo.context`, and `top`/`ancestors` apply it
+/// once per level — made a copying `tail` quadratic in the depth of history.
+/// A tail keeps the elements before it alive; `j` is a single short run, so
+/// holding them costs nothing.
+#[derive(Clone)]
+pub struct ListVal {
+    items: Rc<Vec<Value>>,
+    start: usize,
+}
+
+impl ListVal {
+    pub fn new(items: Vec<Value>) -> ListVal {
+        ListVal {
+            items: Rc::new(items),
+            start: 0,
+        }
+    }
+    /// the list without its first `n` elements, sharing the storage
+    pub fn skip(&self, n: usize) -> ListVal {
+        ListVal {
+            items: self.items.clone(),
+            start: self.items.len().min(self.start.saturating_add(n)),
+        }
+    }
+    pub fn as_slice(&self) -> &[Value] {
+        &self.items[self.start..]
+    }
+}
+
+impl std::ops::Deref for ListVal {
+    type Target = [Value];
+    fn deref(&self) -> &[Value] {
+        self.as_slice()
+    }
 }
 
 pub struct ThunkVal {
@@ -194,6 +232,28 @@ impl BlobVal {
             BlobContent::Conflict(sides) => Ok(render_conflict(sides)),
         }
     }
+    /// number of lines, counted over the bytes in place. Equivalent to
+    /// `String::from_utf8_lossy(&self.bytes()?).lines().count()` — a `\n`
+    /// byte is always a `\n` character in UTF-8, and lossy replacement never
+    /// introduces one — but without copying the content out.
+    pub fn line_count(&self) -> usize {
+        fn count(b: &[u8]) -> usize {
+            let nl = bytecount(b);
+            if b.is_empty() || b.ends_with(b"\n") {
+                nl
+            } else {
+                nl + 1
+            }
+        }
+        fn bytecount(b: &[u8]) -> usize {
+            b.iter().filter(|c| **c == b'\n').count()
+        }
+        match &self.content {
+            BlobContent::Resolved(b) => count(b),
+            BlobContent::Lazy(l) => l.force().map(|b| count(&b)).unwrap_or(1),
+            BlobContent::Conflict(sides) => count(&render_conflict(sides)),
+        }
+    }
     /// the content hash of a lazy blob, if it is one (used to persist an
     /// unchanged blob without reading its bytes)
     pub fn lazy_id(&self) -> Option<&str> {
@@ -364,7 +424,7 @@ impl Value {
 
     pub fn as_list(&self) -> Result<&[Value], Crash> {
         match self {
-            Value::List(xs) => Ok(xs),
+            Value::List(xs) => Ok(xs.as_slice()),
             _ => Err(Crash::new(format!("expected a list, got a {}", self.kind_name()))),
         }
     }
@@ -392,7 +452,7 @@ impl Value {
     }
 
     pub fn list(xs: Vec<Value>) -> Value {
-        Value::List(Rc::new(xs))
+        Value::List(ListVal::new(xs))
     }
 
     pub fn bool(b: bool) -> Value {

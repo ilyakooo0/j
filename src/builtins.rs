@@ -341,11 +341,15 @@ fn b_head(_i: &mut Interp, args: &[Value]) -> BResult {
 }
 
 fn b_tail(_i: &mut Interp, args: &[Value]) -> BResult {
-    let xs = args[0].as_list()?;
-    if xs.is_empty() {
+    if args[0].as_list()?.is_empty() {
         return Err(Crash::new("tail: empty list"));
     }
-    Ok(Value::list(xs[1..].to_vec()))
+    // share the elements rather than copying them: `up` is `tail
+    // repo.context`, so a copying tail made every zipper walk quadratic
+    match &args[0] {
+        Value::List(xs) => Ok(Value::List(xs.skip(1))),
+        v => Err(Crash::new(format!("expected a list, got a {}", v.kind_name()))),
+    }
 }
 
 fn b_last(_i: &mut Interp, args: &[Value]) -> BResult {
@@ -389,9 +393,11 @@ fn b_take(_i: &mut Interp, args: &[Value]) -> BResult {
 }
 
 fn b_drop(_i: &mut Interp, args: &[Value]) -> BResult {
-    let xs = args[1].as_list()?;
-    let n = clamp(args[0].as_int()?, xs.len())?;
-    Ok(Value::list(xs[n..].to_vec()))
+    let n = clamp(args[0].as_int()?, args[1].as_list()?.len())?;
+    match &args[1] {
+        Value::List(xs) => Ok(Value::List(xs.skip(n))),
+        v => Err(Crash::new(format!("expected a list, got a {}", v.kind_name()))),
+    }
 }
 
 fn b_member(_i: &mut Interp, args: &[Value]) -> BResult {
@@ -456,7 +462,7 @@ fn b_concat(_i: &mut Interp, args: &[Value]) -> BResult {
 fn b_append(_i: &mut Interp, args: &[Value]) -> BResult {
     match (&args[0], &args[1]) {
         (Value::List(a), Value::List(b)) => {
-            let mut out = a.as_ref().clone();
+            let mut out = a.to_vec();
             out.extend_from_slice(b);
             Ok(Value::list(out))
         }

@@ -22,6 +22,14 @@ pub struct Interp {
     pub current_def: RefCell<Option<String>>,
     /// the repository as loaded, before snapshotting (for `validate`)
     pub old_repo: RefCell<Option<Value>>,
+    /// Results of applying a config revset the binary itself calls (`trunk`,
+    /// `immutable`), keyed by the identity of the Repo record they were
+    /// applied to. Both are pure and both are asked for more than once per
+    /// run — `immutable` by the focus check and again by rendering or
+    /// persisting — and each evaluation is a full interpreted walk of the
+    /// history. The `Rc` is kept so the address cannot be reused while it is
+    /// a key (§4.1: definitions are pure, so the result cannot change).
+    revsets: RefCell<Vec<(&'static str, Rc<crate::value::RecordMap>, Value)>>,
 }
 
 /// machine state
@@ -170,7 +178,33 @@ impl Interp {
             fresh: RefCell::new(0),
             current_def: RefCell::new(None),
             old_repo: RefCell::new(None),
+            revsets: RefCell::new(Vec::new()),
         }
+    }
+
+    /// Apply one of the config revsets the binary calls itself, reusing the
+    /// result when the same Repo value has already been asked (§7.5).
+    pub fn apply_cached_revset(&mut self, name: &'static str, repo: &Value) -> EResult {
+        let key = match repo {
+            Value::Record(m) => Some(m.clone()),
+            _ => None,
+        };
+        if let Some(k) = &key {
+            for (n, r, v) in self.revsets.borrow().iter() {
+                if *n == name && Rc::ptr_eq(r, k) {
+                    return Ok(v.clone());
+                }
+            }
+        }
+        let f = self
+            .globals
+            .lookup(name)
+            .ok_or_else(|| Crash::new(format!("`{}` is not defined", name)))?;
+        let v = self.apply(f, repo.clone())?;
+        if let Some(k) = key {
+            self.revsets.borrow_mut().push((name, k, v.clone()));
+        }
+        Ok(v)
     }
 
     /// An interpreter shell used only for recursive rendering; panics if any
@@ -184,6 +218,7 @@ impl Interp {
             fresh: RefCell::new(0),
             current_def: RefCell::new(None),
             old_repo: RefCell::new(None),
+            revsets: RefCell::new(Vec::new()),
         }
     }
 

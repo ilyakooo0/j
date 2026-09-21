@@ -266,11 +266,7 @@ fn validate_labels(old: &Value, new: &Value) -> Result<(), Crash> {
 /// The immutable set: the config's `immutable` revset against `old`, plus
 /// every merge commit and its ancestors (§7.5 step 3).
 pub fn compute_immutable(i: &mut Interp, old: &Value) -> Result<BTreeSet<String>, Crash> {
-    let immutable_fn = i
-        .globals
-        .lookup("immutable")
-        .ok_or_else(|| Crash::new("`immutable` is not defined"))?;
-    let v = i.apply(immutable_fn, old.clone())?;
+    let v = i.apply_cached_revset("immutable", old)?;
     let mut set = BTreeSet::new();
     for idv in v.as_list()?.iter() {
         match idv {

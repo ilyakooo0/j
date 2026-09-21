@@ -302,3 +302,39 @@ fn boolean_operators_as_values() {
     check!(i, cfg, "false && (crash \"boom\")", Value::Bool(false));
     check!(i, cfg, "true || (crash \"boom\")", Value::Bool(true));
 }
+
+#[test]
+fn tail_and_drop_share_storage_without_changing_semantics() {
+    // `tail`/`drop` now return a view over the same elements instead of
+    // copying them (a copying `tail` made every zipper walk quadratic, since
+    // `up` is `tail repo.context`). The results must still be ordinary lists.
+    let (mut i, cfg) = make_interp();
+    check!(i, cfg, "tail [1 2 3]", ints(&[2, 3]));
+    check!(i, cfg, "tail (tail [1 2 3])", ints(&[3]));
+    check!(i, cfg, "tail (tail (tail [1 2 3]))", ints(&[]));
+    check!(i, cfg, "drop 2 [1 2 3 4]", ints(&[3, 4]));
+    check!(i, cfg, "drop 0 [1 2]", ints(&[1, 2]));
+    check!(i, cfg, "drop 99 [1 2]", ints(&[]));
+    check!(i, cfg, "drop 1 (drop 1 [1 2 3 4])", ints(&[3, 4]));
+    // a view is equal to the same list built directly
+    check!(i, cfg, "tail [1 2 3] == [2 3]", Value::Bool(true));
+    check!(i, cfg, "drop 1 (tail [1 2 3 4]) == [3 4]", Value::Bool(true));
+    // and behaves like one everywhere else
+    check!(i, cfg, "length (tail [1 2 3])", Value::int(2));
+    check!(i, cfg, "head (tail [1 2 3])", Value::int(2));
+    check!(i, cfg, "last (tail [1 2 3])", Value::int(3));
+    check!(i, cfg, "nth 0 (tail [1 2 3])", Value::int(2));
+    check!(i, cfg, "tail [1 2 3] ++ [9]", ints(&[2, 3, 9]));
+    check!(i, cfg, "0 :: tail [1 2 3]", ints(&[0, 2, 3]));
+    check!(i, cfg, "take 1 (tail [1 2 3])", ints(&[2]));
+    check!(i, cfg, "map (\\x -> x * 2) (tail [1 2 3])", ints(&[4, 6]));
+    check!(i, cfg, "member 2 (tail [1 2 3])", Value::Bool(true));
+    check!(i, cfg, "member 1 (tail [1 2 3])", Value::Bool(false));
+    check!(i, cfg, "concat [(tail [1 2]) (tail [3 4])]", ints(&[2, 4]));
+    check!(i, cfg, "null (tail [1])", Value::Bool(true));
+    // the original is untouched by taking a tail of it
+    check!(i, cfg, "let xs = [1 2 3] in tail xs ++ xs", ints(&[2, 3, 1, 2, 3]));
+    // show round-trips a view
+    check!(i, cfg, "show (tail [1 2 3])", Value::text("[2 3]"));
+    assert!(crash(&mut i, &cfg, "tail []").contains("empty"));
+}
