@@ -459,7 +459,7 @@ impl Value {
 pub fn attach_pending(v: &Value, name: &str, contract: Rc<crate::shape::Contract>) -> Value {
     let pending = Some((
         name.to_string(),
-        Rc::new(crate::shape::ContractExpr::Known(contract)),
+        Rc::new(crate::shape::ContractExpr::Known { contract, at: 0 }),
     ));
     match v {
         Value::Fun(fv) => match fv.as_ref() {

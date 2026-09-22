@@ -134,10 +134,12 @@ fn is_type_var(n: &str) -> bool {
 }
 
 /// A compiled signature: a chain of parameter types and a final result type.
+/// The types are shared, so handing one out is a refcount bump rather than a
+/// deep copy — contracts are consulted on every call.
 #[derive(Clone, Debug)]
 pub struct Contract {
-    pub params: Vec<TypeExpr>,
-    pub result: TypeExpr,
+    pub params: Vec<Rc2<TypeExpr>>,
+    pub result: Rc2<TypeExpr>,
 }
 
 pub fn compile_contract(shapes: &Shapes, ty: &TypeExpr) -> Contract {
@@ -146,7 +148,7 @@ pub fn compile_contract(shapes: &Shapes, ty: &TypeExpr) -> Contract {
     loop {
         match cur {
             TypeExpr::Fun(a, b) => {
-                params.push((**a).clone());
+                params.push(a.clone());
                 cur = b;
             }
             TypeExpr::Con(n) => {
@@ -164,7 +166,7 @@ pub fn compile_contract(shapes: &Shapes, ty: &TypeExpr) -> Contract {
     }
     Contract {
         params,
-        result: cur.clone(),
+        result: Rc2::new(cur.clone()),
     }
 }
 
@@ -275,7 +277,10 @@ use std::rc::Rc as Rc2;
 pub enum ContractExpr {
     /// no contract information; arg checks pass through
     Unknown,
-    Known(Rc2<Contract>),
+    /// a signature with its first `at` parameters already supplied; advancing
+    /// it is an index bump, where rebuilding the shortened parameter list
+    /// copied every remaining type on every application
+    Known { contract: Rc2<Contract>, at: usize },
     /// compose(f, g): (f . g); both contract expressions
     Compose(Box<ContractExpr>, Box<ContractExpr>),
     /// apply e to an argument that checked against e's first parameter
@@ -284,10 +289,10 @@ pub enum ContractExpr {
 
 impl ContractExpr {
     /// The type of the next parameter this function expects, if known.
-    pub fn next_param(&self) -> Option<TypeExpr> {
+    pub fn next_param(&self) -> Option<Rc2<TypeExpr>> {
         match self {
             ContractExpr::Unknown => None,
-            ContractExpr::Known(c) => c.params.first().cloned(),
+            ContractExpr::Known { contract, at } => contract.params.get(*at).cloned(),
             ContractExpr::Compose(f, g) => g
                 .next_param()
                 .or_else(|| f.next_param())
@@ -301,12 +306,12 @@ impl ContractExpr {
     }
 
     /// The result type once all parameters are supplied.
-    pub fn result_after(&self) -> Option<TypeExpr> {
+    pub fn result_after(&self) -> Option<Rc2<TypeExpr>> {
         match self {
             ContractExpr::Unknown => None,
-            ContractExpr::Known(c) => {
-                if c.params.is_empty() {
-                    Some(c.result.clone())
+            ContractExpr::Known { contract, at } => {
+                if *at >= contract.params.len() {
+                    Some(contract.result.clone())
                 } else {
                     None
                 }
@@ -326,7 +331,7 @@ impl ContractExpr {
     pub fn is_exhausted(&self) -> bool {
         match self {
             ContractExpr::Unknown => false,
-            ContractExpr::Known(c) => c.params.is_empty(),
+            ContractExpr::Known { contract, at } => *at >= contract.params.len(),
             ContractExpr::Compose(_, g) => g.is_exhausted(),
             ContractExpr::ApplyFirst(_) => false,
         }
@@ -334,19 +339,24 @@ impl ContractExpr {
 
     /// Advance after one argument has been supplied and checked.
     pub fn apply_first_rc(self: Rc2<ContractExpr>) -> ContractExpr {
-        ContractExpr::apply_first(Box::new((*self).clone()))
+        // the common case advances without allocating anything
+        match &*self {
+            ContractExpr::Unknown => ContractExpr::Unknown,
+            ContractExpr::Known { contract, at } => ContractExpr::Known {
+                contract: contract.clone(),
+                at: contract.params.len().min(at + 1),
+            },
+            _ => ContractExpr::apply_first(Box::new((*self).clone())),
+        }
     }
 
     /// Advance after one argument has been supplied and checked.
     pub fn apply_first(self: Box<ContractExpr>) -> ContractExpr {
         match *self {
             ContractExpr::Unknown => ContractExpr::Unknown,
-            ContractExpr::Known(c) => {
-                let mut c2 = (*c).clone();
-                if !c2.params.is_empty() {
-                    c2.params.remove(0);
-                }
-                ContractExpr::Known(Rc2::new(c2))
+            ContractExpr::Known { contract, at } => {
+                let at = contract.params.len().min(at + 1);
+                ContractExpr::Known { contract, at }
             }
             ContractExpr::Compose(f, g) => {
                 if !g.is_exhausted() {
@@ -363,7 +373,7 @@ impl ContractExpr {
     /// Number of remaining parameters, if known and not nested.
     pub fn params_len(&self) -> usize {
         match self {
-            ContractExpr::Known(c) => c.params.len(),
+            ContractExpr::Known { contract, at } => contract.params.len() - at,
             _ => 99,
         }
     }

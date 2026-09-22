@@ -642,3 +642,48 @@ fn by_then_climbing_back_restores_the_history() {
         );
     }
 }
+
+#[test]
+fn repeated_navigation_is_consistent() {
+    // `top_of` is memoised on the identity of the value it was asked about,
+    // and `by` is applied to the same repo once per id in a revset walk. The
+    // memo must not let one navigation affect the next, including across
+    // repos that differ only in where they are focused.
+    let (repo, ids) = linear_repo(6);
+    let mut seen: Vec<Value> = Vec::new();
+    for id in &ids {
+        seen.push(j::repo::by_id(&repo, id).unwrap().expect("found"));
+    }
+    // asking again, interleaved with other repos, gives the same answers
+    let (other, other_ids) = linear_repo(4);
+    for (k, id) in ids.iter().enumerate() {
+        let again = j::repo::by_id(&repo, id).unwrap().expect("found");
+        assert!(
+            value_eq(&again, &seen[k]).unwrap_or(false),
+            "second lookup of {} differs",
+            id
+        );
+        // navigating a different repo in between must not disturb it
+        let o = j::repo::by_id(&other, &other_ids[0]).unwrap().expect("found");
+        match o.field("root").unwrap().field("id").unwrap() {
+            Value::Id(f) => assert_eq!(&*f, &other_ids[0]),
+            _ => panic!("no id"),
+        }
+        let third = j::repo::by_id(&repo, id).unwrap().expect("found");
+        assert!(
+            value_eq(&third, &seen[k]).unwrap_or(false),
+            "lookup of {} disturbed by another repo",
+            id
+        );
+    }
+    // and navigating from an already-refocused location still reaches the top
+    for loc in &seen {
+        for id in &ids {
+            let from_loc = j::repo::by_id(loc, id).unwrap().expect("found");
+            match from_loc.field("root").unwrap().field("id").unwrap() {
+                Value::Id(f) => assert_eq!(&*f, id, "reached the wrong commit"),
+                _ => panic!("no id"),
+            }
+        }
+    }
+}

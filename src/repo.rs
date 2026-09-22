@@ -82,8 +82,40 @@ fn id_of(commit: &Value) -> Result<String, Crash> {
     }
 }
 
+thread_local! {
+    /// The last location climbed to the top, and the value it was climbed
+    /// from. A revset walk applies `by` to the same repo once per id, and
+    /// each climb rebuilds a location per level of depth; the answer only
+    /// depends on the value, which cannot change. Holding the `Rc` keeps the
+    /// address from being reused while it is the key.
+    static TOP_MEMO: std::cell::RefCell<Option<(std::rc::Rc<crate::value::RecordMap>, Value)>> =
+        const { std::cell::RefCell::new(None) };
+}
+
 /// move a location to the top of history
 fn top_of(repo: &Value) -> Result<Value, Crash> {
+    let key = match repo {
+        Value::Record(m) => Some(m.clone()),
+        _ => None,
+    };
+    if let Some(k) = &key {
+        let hit = TOP_MEMO.with(|c| {
+            c.borrow().as_ref().and_then(|(cached, top)| {
+                std::rc::Rc::ptr_eq(cached, k).then(|| top.clone())
+            })
+        });
+        if let Some(top) = hit {
+            return Ok(top);
+        }
+    }
+    let top = top_of_uncached(repo)?;
+    if let Some(k) = key {
+        TOP_MEMO.with(|c| *c.borrow_mut() = Some((k, top.clone())));
+    }
+    Ok(top)
+}
+
+fn top_of_uncached(repo: &Value) -> Result<Value, Crash> {
     let mut cur = repo.clone();
     loop {
         // ask whether the context is empty without copying it: this runs once
